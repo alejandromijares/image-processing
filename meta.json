@@ -6,6 +6,14 @@
   "description": "Modular camera component: color-correction",
   "applications": null,
   "markdown_link": "README.md",
+  "models": [
+    {
+      "api": "rdk:component:camera",
+      "model": "brad-grigsby:image-processing:color-correction",
+      "markdown_link": "README.md#model-brad-grigsbyimage-processingcolor-correction",
+      "short_description": ""
+    }
+  ],
   "entrypoint": "dist/main",
   "first_run": "",
   "build": {

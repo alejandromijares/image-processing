@@ -312,7 +312,7 @@ class ColorCorrection(Camera, EasyResource):
     # To enable debug-level logging, either run viam-server with the --debug option,
     # or configure your resource/machine to display debug logs.
     MODEL: ClassVar[Model] = Model(
-        ModelFamily("bradgrigsby", "image-processing"), "color-correction"
+        ModelFamily("brad-grigsby", "image-processing"), "color-correction"
     )
 
     @classmethod
