@@ -1,0 +1,4 @@
+viam-sdk==0.77.0
+typing-extensions
+numpy
+pillow

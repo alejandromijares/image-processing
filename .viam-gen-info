@@ -1,0 +1,13 @@
+{
+  "module_name": "image-processing",
+  "visibility": "public",
+  "namespace": "brad-grigsby",
+  "language": "python",
+  "resource_type": "component",
+  "resource_subtype": "sensor",
+  "model_name": "color-correction",
+  "initialize_git": false,
+  "generator_version": "0.1.0",
+  "generated_on": "2026-06-05T00:13:59.11972Z",
+  "module_readme_link": "README.md"
+}
