@@ -2,7 +2,7 @@
   "$schema": "https://dl.viam.dev/module.schema.json",
   "module_id": "brad-grigsby:image-processing",
   "visibility": "public",
-  "url": "",
+  "url": "https://github.com/bgrigsby8/image-processing",
   "description": "Modular camera component: color-correction",
   "applications": null,
   "markdown_link": "README.md",
