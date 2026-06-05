@@ -3,7 +3,7 @@
   "module_id": "brad-grigsby:image-processing",
   "visibility": "public",
   "url": "https://github.com/bgrigsby8/image-processing",
-  "description": "Modular camera component: color-correction",
+  "description": "Modular camera components: color-correction, ptp",
   "applications": null,
   "markdown_link": "README.md",
   "models": [
@@ -12,6 +12,12 @@
       "model": "brad-grigsby:image-processing:color-correction",
       "markdown_link": "README.md#model-brad-grigsbyimage-processingcolor-correction",
       "short_description": ""
+    },
+    {
+      "api": "rdk:component:camera",
+      "model": "brad-grigsby:image-processing:ptp",
+      "markdown_link": "brad-grigsby_image-processing_ptp.md",
+      "short_description": "Download images from a USB-connected camera over PTP (libgphoto2)."
     }
   ],
   "entrypoint": "dist/main",
