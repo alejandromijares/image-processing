@@ -260,8 +260,17 @@ class PTP(Camera, EasyResource):
     def new(
         cls, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
     ) -> Self:
-        """Create a new instance of this Camera component."""
-        return super().new(config, dependencies)
+        """Create a new instance of this Camera component.
+
+        ``EasyResource.new`` only constructs the instance - it does *not* call
+        ``reconfigure``, and viam-server only calls ``reconfigure`` on later
+        config changes, not on the initial add. So we must configure here, or
+        ``self._session`` (and the other attributes set in ``reconfigure``)
+        won't exist when the first DoCommand arrives.
+        """
+        instance = cls(config.name)
+        instance.reconfigure(config, dependencies)
+        return instance
 
     @classmethod
     def validate_config(
@@ -301,8 +310,6 @@ class PTP(Camera, EasyResource):
         if session is not None:
             session.close()
         self._session = PTPSession(self._port, self._model_match)
-
-        return super().reconfigure(config, dependencies)
 
     # ------------------------------------------------------------------
     # Helpers

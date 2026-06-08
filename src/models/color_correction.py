@@ -319,8 +319,17 @@ class ColorCorrection(Camera, EasyResource):
     def new(
         cls, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
     ) -> Self:
-        """Create a new instance of this Camera component."""
-        return super().new(config, dependencies)
+        """Create a new instance of this Camera component.
+
+        ``EasyResource.new`` only constructs the instance - it does *not* call
+        ``reconfigure``, and viam-server only calls ``reconfigure`` on later
+        config changes, not on the initial add. So we must configure here, or
+        ``self.camera``/``self.corrector`` won't exist when the first request
+        arrives.
+        """
+        instance = cls(config.name)
+        instance.reconfigure(config, dependencies)
+        return instance
 
     @classmethod
     def validate_config(
@@ -360,8 +369,6 @@ class ColorCorrection(Camera, EasyResource):
         else:
             self.corrector = ColorCorrector.identity()
             self.logger.info("No `ccm` configured; passing images through uncorrected")
-
-        return super().reconfigure(config, dependencies)
 
     def _correct_viam_image(self, image: ViamImage) -> ViamImage:
         """Apply the CCM to a single ViamImage, preserving its mime type."""

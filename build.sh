@@ -1,19 +1,22 @@
 #!/bin/sh
 cd `dirname $0`
 
-# Create a virtual environment to run our code
-VENV_NAME="venv"
-PYTHON="$VENV_NAME/bin/python"
+# No PyInstaller: libgphoto2 dlopen's its camera/port drivers at runtime, which
+# a single-file freeze can't carry. Instead we ship the source and let run.sh
+# build the venv (via setup.sh) on the target, where the gphoto2 wheel's bundled
+# drivers land at a path libgphoto2 can actually find.
+mkdir -p dist
 
-if ! $PYTHON -m pip install pyinstaller -Uqq; then
-    exit 1
-fi
+# Compatibility launcher: a machine that was reloaded under the old PyInstaller
+# build has `dist/main` cached as its entrypoint. Ship a shim at that path that
+# forwards (with args) to the real venv launcher, so a reload works whether the
+# config points at dist/main or run.sh.
+cat > dist/main <<'EOF'
+#!/bin/sh
+exec "`dirname $0`/../run.sh" "$@"
+EOF
+chmod +x dist/main
 
-$PYTHON -m PyInstaller --onefile --hidden-import="googleapiclient" src/main.py
-
-TAR_FILES="meta.json ./dist/main"
-FIRST_RUN=$($PYTHON -c "import json; print(json.load(open('meta.json')).get('first_run', ''))" 2>/dev/null)
-if [ -n "$FIRST_RUN" ] && [ -f "$FIRST_RUN" ]; then
-    TAR_FILES="$TAR_FILES $FIRST_RUN"
-fi
-tar -czvf dist/archive.tar.gz $TAR_FILES
+tar -czvf dist/archive.tar.gz \
+    --exclude='__pycache__' \
+    run.sh setup.sh requirements.txt meta.json src dist/main
