@@ -135,6 +135,7 @@ def load_linear_rgb(
     *,
     white_balance: Union[str, Sequence[float], None] = "camera",
     exposure_stops: float = 0.0,
+    user_flip: Optional[int] = None,
 ) -> np.ndarray:
     """
     Load an image file into a **linear-light** float32 RGB array in [0, 1],
@@ -144,6 +145,11 @@ def load_linear_rgb(
     off, into the sRGB color space - so the only thing left to apply downstream
     is the CCM (in linear) and the output transfer curve. ``white_balance`` and
     ``exposure_stops`` are applied here, at the raw stage, where they belong.
+
+    ``user_flip`` overrides libraw's orientation handling (default ``None`` =
+    auto-rotate from EXIF). Pass ``0`` to disable rotation so the output lines
+    up pixel-for-pixel with ``raw_image_visible`` / ``render_raw_for_detection``
+    - used during color calibration so detected patch centres map across renders.
 
     Non-RAW inputs (JPEG/PNG/TIFF) are assumed to be sRGB-encoded; they're read
     via PIL and linearized. They can't carry more than their stored precision.
@@ -173,9 +179,133 @@ def load_linear_rgb(
             # exp_shift is a linear multiplier; libraw clamps it to [0.25, 8].
             kwargs["exp_correc"] = True
             kwargs["exp_shift"] = float(np.clip(2.0 ** exposure_stops, 0.25, 8.0))
+        if user_flip is not None:
+            kwargs["user_flip"] = int(user_flip)
         with rawpy.imread(path) as raw:
             rgb16 = raw.postprocess(**kwargs)
         return (np.asarray(rgb16, dtype=np.float32) / 65535.0)
+
+
+# ---------------------------------------------------------------------------
+# RAW colour-calibration helpers (ColorChecker white balance + detection)
+# ---------------------------------------------------------------------------
+
+def render_raw_for_detection(path: str) -> np.ndarray:
+    """
+    Demosaic a RAW into an 8-bit sRGB ``(H, W, 3)`` RGB array for ColorChecker
+    *detection*.
+
+    Rendered with camera white balance and a display gamma so the chart looks
+    natural to the detector, and crucially with ``user_flip=0`` so the result is
+    in the same orientation and (near-identical) resolution as
+    ``raw_image_visible`` - letting patch centres found here map straight onto
+    the raw CFA for white-balance sampling, and onto a matching linear render
+    (``load_linear_rgb(..., user_flip=0)``) for the CCM fit.
+    """
+    if not is_raw(path):
+        raise ValueError(f"render_raw_for_detection expects a RAW file, got {path!r}")
+    if rawpy is None:
+        raise RuntimeError(
+            f"cannot decode RAW file {os.path.basename(path)!r}: rawpy is not "
+            f"available ({_RAWPY_IMPORT_ERROR}); install `rawpy`"
+        )
+    with rawpy.imread(path) as raw:
+        rgb8 = raw.postprocess(
+            output_bps=8,
+            no_auto_bright=True,
+            use_camera_wb=True,
+            output_color=rawpy.ColorSpace.sRGB,
+            user_flip=0,
+        )
+    return np.asarray(rgb8, dtype=np.uint8)
+
+
+def compute_raw_wb_multipliers(
+    path: str,
+    boxes_norm: Sequence[Sequence[float]],
+    *,
+    saturation_fraction: float = 0.95,
+) -> List[float]:
+    """
+    Measure ``[r, g, b, g2]`` white-balance multipliers (the format rawpy's
+    ``user_wb`` wants) from the raw Bayer/CFA samples under neutral patches.
+
+    This is the correct place to compute white balance: ``user_wb`` is applied
+    to the CFA channels *before* demosaic, so we read the raw sensor values - not
+    the demosaiced RGB - average each of the four CFA channels (R, G1, B, G2)
+    over the neutral regions after subtracting the per-channel black level, and
+    return multipliers that drive a neutral patch to equal channel values
+    (greens normalised to ~1.0).
+
+    Parameters
+    ----------
+    path : a RAW file path.
+    boxes_norm : neutral-patch regions as ``(x0, y0, x1, y1)`` boxes, each
+        coordinate a fraction in [0, 1] of the detection render's width/height
+        (which matches ``raw_image_visible`` since both use ``user_flip=0``).
+        Use mid-grey patches (Neutral 8 / 6.5) - not the white patch (clips) or
+        black (noisy).
+    saturation_fraction : skip CFA samples at or above this fraction of the
+        white level, so a clipped highlight can't skew the average.
+    """
+    if rawpy is None:
+        raise RuntimeError(
+            f"cannot decode RAW file {os.path.basename(path)!r}: rawpy is not "
+            f"available ({_RAWPY_IMPORT_ERROR}); install `rawpy`"
+        )
+    if not boxes_norm:
+        raise ValueError("compute_raw_wb_multipliers needs at least one neutral region")
+
+    with rawpy.imread(path) as raw:
+        cfa = raw.raw_image_visible.astype(np.float32)
+        colors = np.asarray(raw.raw_colors_visible)
+        black = np.asarray(raw.black_level_per_channel, dtype=np.float32)
+        white = float(raw.white_level)
+        height, width = cfa.shape
+
+        region = np.zeros((height, width), dtype=bool)
+        for box in boxes_norm:
+            x0, y0, x1, y1 = box
+            ix0 = max(0, min(width - 1, int(round(x0 * width))))
+            ix1 = max(0, min(width, int(round(x1 * width))))
+            iy0 = max(0, min(height - 1, int(round(y0 * height))))
+            iy1 = max(0, min(height, int(round(y1 * height))))
+            if ix1 > ix0 and iy1 > iy0:
+                region[iy0:iy1, ix0:ix1] = True
+        if not region.any():
+            raise ValueError(
+                "neutral-patch regions mapped to an empty area of the raw frame"
+            )
+
+        sat_level = white * float(saturation_fraction)
+        # libraw colour indices: 0=R, 1=G1, 2=B, 3=G2 (second green).
+        avg = np.full(4, np.nan, dtype=np.float64)
+        for c in range(4):
+            sel = region & (colors == c) & (cfa < sat_level)
+            if sel.any():
+                bl = float(black[c]) if c < black.size else float(black[0])
+                vals = cfa[sel] - bl
+                vals = vals[vals > 0]
+                if vals.size:
+                    avg[c] = float(vals.mean())
+
+    r, g1, b, g2 = avg
+    # Sensors that label both greens as one colour have no index-3 samples.
+    if np.isnan(g2):
+        g2 = g1
+    if np.isnan(g1):
+        g1 = g2
+    greens = [v for v in (g1, g2) if not np.isnan(v)]
+    if not greens or np.isnan(r) or np.isnan(b) or r <= 0 or b <= 0:
+        raise ValueError(
+            "could not measure all CFA channels under the neutral patch; the "
+            "chart may be over- or under-exposed, or the region missed the patch"
+        )
+    g_ref = float(np.mean(greens))
+    wb = [g_ref / r, g_ref / g1, g_ref / b, g_ref / g2]
+    if not all(np.isfinite(m) for m in wb) or any(m <= 0 for m in wb):
+        raise ValueError(f"computed non-physical white-balance multipliers {wb}")
+    return [float(m) for m in wb]
 
     with Image.open(path) as img:
         arr = np.array(img.convert("RGB"), dtype=np.float32) / 255.0

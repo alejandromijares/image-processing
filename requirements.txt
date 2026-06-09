@@ -4,5 +4,6 @@ numpy
 pillow
 rawpy
 tifffile
-opencv-python-headless
+# contrib build needed for the cv2.mcc ColorChecker detector (color_correction)
+opencv-contrib-python-headless
 gphoto2; platform_system != "Windows"

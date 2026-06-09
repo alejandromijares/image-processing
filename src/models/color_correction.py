@@ -48,14 +48,22 @@ Two ways to get corrected images out of this component:
 Calibration:
 
        {"calibrate_color": {}}
-           -> grab a frame of the ColorChecker from the source camera's live
-              view, fit a CCM, and return it.
+           -> grab a live-view frame, auto-detect the ColorChecker (cv2.mcc),
+              fit a CCM, and return it. No white balance (no RAW from live view).
        {"calibrate_color": {"use_capture": true}}
-           -> calibrate from a full-resolution still (via the source's capture
-              DoCommand) and return the fitted CCM.
+           -> trigger a full-resolution RAW still, auto-detect the chart,
+              measure white balance from the raw CFA under the neutral patches
+              ([r,g,b,g2] for rawpy's user_wb), and fit the CCM under that same
+              white balance. Returns both.
+       {"calibrate_color": {"path": "/photos/chart.CR3"}}
+           -> same, from a RAW already on disk (no camera trigger).
 
-`calibrate_color` returns the fitted 3x3 matrix; copy it into the component's
-``ccm`` config attribute to make the correction persist across restarts.
+The chart is detected automatically anywhere in frame (cv2.mcc, from
+opencv-contrib) - no clicking patch centres. Pass ``patch_centers`` (24 [x,y])
+to override detection, or ``compute_wb: false`` to skip white balance.
+`calibrate_color` returns the fitted 3x3 ``ccm`` and the 4-value
+``white_balance``; copy them into the component's ``ccm`` / ``white_balance``
+config attributes to make the calibration persist across restarts.
 """
 
 import base64
@@ -90,13 +98,26 @@ from viam.utils import ValueTypes, struct_to_dict
 
 from models.image_io import (
     EXPORT_FORMATS,
+    compute_raw_wb_multipliers,
     export_renditions,
     is_raw,
     linear_to_jpeg_base64,
     linear_to_srgb,
     load_linear_rgb,
+    render_raw_for_detection,
     srgb_to_linear,
 )
+
+# OpenCV's ColorChecker detector (cv2.mcc) lives in opencv-contrib; import lazily
+# so the module still loads (and the streaming/develop paths work) on a host
+# without it - calibration raises a clean, actionable error at point of use.
+try:
+    import cv2  # type: ignore
+
+    _CV2_IMPORT_ERROR: Optional[Exception] = None
+except Exception as exc:  # pragma: no cover - depends on the host
+    cv2 = None  # type: ignore
+    _CV2_IMPORT_ERROR = exc
 
 # Default delivery set when `output_formats` isn't configured. Override in
 # config to trim it (e.g. just ["tiff16", "jpeg"] for a master + proof).
@@ -165,6 +186,98 @@ def _fit_ccm(measured: np.ndarray, reference: np.ndarray) -> np.ndarray:
     return solution.T  # shape (3, 3)
 
 
+# ---------------------------------------------------------------------------
+# Automatic ColorChecker detection (cv2.mcc)
+# ---------------------------------------------------------------------------
+
+def _order_corners(pts: np.ndarray) -> np.ndarray:
+    """
+    Order 4 chart corners as [top-left, top-right, bottom-right, bottom-left].
+
+    Uses the x+y / x-y heuristic, which is robust for a chart that's roughly
+    upright (rotation < ~45deg) - the studio case where you drop the board in
+    frame. cv2.mcc already corrects perspective; this just fixes the winding so
+    the bilinear grid below lands dark-skin patch first (REFERENCE_SRGB order).
+    """
+    pts = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
+    s = pts.sum(axis=1)
+    d = pts[:, 0] - pts[:, 1]
+    return np.array([
+        pts[np.argmin(s)],  # top-left      (smallest x+y)
+        pts[np.argmax(d)],  # top-right     (largest  x-y)
+        pts[np.argmax(s)],  # bottom-right  (largest  x+y)
+        pts[np.argmin(d)],  # bottom-left   (smallest x-y)
+    ], dtype=np.float32)
+
+
+def detect_colorchecker(
+    img_rgb: np.ndarray, *, rows: int = 4, cols: int = 6
+) -> Optional[Dict[str, Any]]:
+    """
+    Auto-detect a ColorChecker Classic anywhere in ``img_rgb`` (uint8 RGB).
+
+    Returns ``None`` if no chart is found, else a dict with:
+      ``centers``            (24, 2) float patch centres in pixel coords, in
+                             REFERENCE_SRGB order (dark skin -> black).
+      ``neutral_boxes_norm`` (x0, y0, x1, y1) boxes (fractions of W/H) over the
+                             Neutral 8 and Neutral 6.5 patches, for raw white
+                             balance sampling.
+
+    Patch centres come from bilinearly interpolating the detected chart box over
+    a rows x cols grid - geometry only, so the same centres are valid on any
+    co-registered render (the linear CCM render, the raw CFA).
+    """
+    if cv2 is None:
+        raise RuntimeError(
+            f"ColorChecker auto-detection needs OpenCV, which isn't available "
+            f"({_CV2_IMPORT_ERROR}); install `opencv-contrib-python-headless`"
+        )
+    if not hasattr(cv2, "mcc"):
+        raise RuntimeError(
+            "this OpenCV build has no `mcc` module; the ColorChecker detector "
+            "ships in opencv-contrib - install `opencv-contrib-python-headless` "
+            "(replacing `opencv-python-headless`), or pass explicit `patch_centers`"
+        )
+
+    bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    detector = cv2.mcc.CCheckerDetector_create()
+    if not detector.process(bgr, cv2.mcc.MCC24):
+        return None
+    checkers = detector.getListColorChecker()
+    if not checkers:
+        return None
+
+    box = np.asarray(checkers[0].getBox(), dtype=np.float32).reshape(-1, 2)
+    if box.shape[0] != 4:
+        return None
+    tl, tr, br, bl = _order_corners(box)
+
+    def grid_point(u: float, v: float) -> np.ndarray:
+        top = tl + (tr - tl) * u
+        bot = bl + (br - bl) * u
+        return top + (bot - top) * v
+
+    centers = np.zeros((rows * cols, 2), dtype=np.float32)
+    for r in range(rows):
+        for c in range(cols):
+            centers[r * cols + c] = grid_point((c + 0.5) / cols, (r + 0.5) / rows)
+
+    # Neutral 8 (#20) and Neutral 6.5 (#21): bottom row, 2nd and 3rd cells. Avoid
+    # the white patch (clips) and black (noisy). Sample the inner ~40% of each.
+    h, w = img_rgb.shape[:2]
+    half_w = 0.2 * float(np.linalg.norm(tr - tl)) / cols
+    half_h = 0.2 * float(np.linalg.norm(bl - tl)) / rows
+    neutral_boxes_norm: List[Tuple[float, float, float, float]] = []
+    for idx in ((rows - 1) * cols + 1, (rows - 1) * cols + 2):
+        cx, cy = centers[idx]
+        neutral_boxes_norm.append((
+            (cx - half_w) / w, (cy - half_h) / h,
+            (cx + half_w) / w, (cy + half_h) / h,
+        ))
+
+    return {"centers": centers, "neutral_boxes_norm": neutral_boxes_norm}
+
+
 class PatchSampler:
     """Locate and sample the 24 ColorChecker patches from an RGB image."""
 
@@ -222,6 +335,26 @@ class PatchSampler:
             samples.append(np.median(patch, axis=0))
         measured_srgb = np.array(samples, dtype=np.float32) / 255.0
         return _srgb_to_linear(measured_srgb)
+
+    @staticmethod
+    def sample_linear_at_centers(
+        img_linear: np.ndarray,
+        centers: Sequence[Tuple[float, float]],
+        radius: int = 10,
+    ) -> np.ndarray:
+        """
+        Sample patches from an already-**linear-light** float RGB image at the
+        given (x, y) centres - the precise path when calibrating from a 16-bit
+        linear RAW render (no sRGB round-trip). Returns (N, 3) float32 linear RGB.
+        """
+        h, w = img_linear.shape[:2]
+        samples = []
+        for x, y in centers:
+            x, y = int(round(float(x))), int(round(float(y)))
+            x0, y0 = max(0, x - radius), max(0, y - radius)
+            patch = img_linear[y0:y + radius, x0:x + radius].reshape(-1, 3)
+            samples.append(np.median(patch, axis=0))
+        return np.asarray(samples, dtype=np.float32)
 
 
 class ColorCorrector:
@@ -565,60 +698,164 @@ class ColorCorrection(Camera, EasyResource):
             "its `download_dir` so captures are written to disk"
         )
 
-    async def _acquire_rgb(self, opts: Mapping[str, Any], timeout: Optional[float]) -> np.ndarray:
+    async def _acquire_calibration_source(
+        self, opts: Mapping[str, Any], timeout: Optional[float]
+    ) -> Tuple[Optional[str], Optional[np.ndarray]]:
         """
-        Grab a single 8-bit sRGB frame from the source camera for *calibration*.
+        Get the source to calibrate from, as ``(raw_path, rgb8)``.
 
-        With ``use_capture: true`` it triggers the source's full-resolution still
-        and renders it to 8-bit sRGB (precision the CCM fit doesn't need higher);
-        otherwise it pulls the first JPEG/PNG frame from the streaming
-        ``get_images`` path.
+        ``raw_path`` is set when a RAW file is on disk - the path that unlocks
+        raw-CFA white balance. Otherwise ``rgb8`` is an 8-bit sRGB frame for
+        CCM-only calibration. Exactly one is non-None.
+
+        Resolution order: explicit ``path`` -> ``use_capture`` (trigger a still
+        on the source, prefer its ``saved_to`` RAW) -> the streaming frame.
         """
+        def _file_to_rgb8(p: str) -> np.ndarray:
+            linear = load_linear_rgb(str(p), white_balance="camera")
+            return (linear_to_srgb(linear) * 255.0).clip(0, 255).astype(np.uint8)
+
+        path = opts.get("path")
+        if path:
+            if is_raw(str(path)):
+                return str(path), None
+            return None, _file_to_rgb8(str(path))
+
         if opts.get("use_capture"):
             capture_opts = opts.get("capture_options", {"af": True})
-            white_balance = opts.get("white_balance", self._white_balance)
-            source_resp = await self.camera.do_command({"capture": capture_opts}, timeout=timeout)
+            source_resp = await self.camera.do_command(
+                {"capture": capture_opts}, timeout=timeout
+            )
             capture = source_resp.get("capture", source_resp)
-            linear, _ = self._linear_from_capture_response(capture, white_balance, 0.0)
-            return (linear_to_srgb(linear) * 255.0).clip(0, 255).astype(np.uint8)
+            if isinstance(capture, Mapping):
+                p = capture.get("saved_to") or capture.get("path")
+                if p and is_raw(str(p)):
+                    return str(p), None
+                if p:
+                    return None, _file_to_rgb8(str(p))
+                b64 = capture.get("image_base64")
+                if b64:
+                    return None, _base64_to_rgb(b64)
+            raise ValueError(
+                "source `capture` returned nothing usable for calibration "
+                "(no RAW `saved_to`, file `path`, or inline `image_base64`)"
+            )
 
         images, _ = await self.camera.get_images(timeout=timeout)
         for image in images:
             if image.mime_type in (CameraMimeType.JPEG, CameraMimeType.PNG):
-                return np.array(viam_to_pil_image(image).convert("RGB"))
+                return None, np.array(viam_to_pil_image(image).convert("RGB"))
         raise ValueError("source camera returned no JPEG/PNG image to use")
 
     async def _calibrate_color(
         self, opts: Mapping[str, Any], timeout: Optional[float]
     ) -> Mapping[str, ValueTypes]:
         """
-        Fit a CCM from a ColorChecker frame and apply it to this component
-        immediately. The fitted matrix is returned so it can be copied into the
-        ``ccm`` config attribute to persist across restarts.
+        Auto-calibrate from a ColorChecker frame: detect the chart (cv2.mcc),
+        measure white balance from the raw CFA, and fit a CCM under that same
+        white balance. Both are applied to this component immediately and
+        returned so they can be copied into the ``ccm`` / ``white_balance``
+        config attributes to persist across restarts.
 
-        Options: ``use_capture`` (bool), ``capture_options`` (passed to the
-        source capture), ``patch_centers`` (24 [x, y] coords), ``radius`` (int).
+        Options (all optional):
+          ``use_capture``    trigger a full-res still on the source (needed for
+                             white balance - the RAW must be on disk).
+          ``path``           calibrate from a RAW/image file already on disk.
+          ``capture_options``forwarded to the source ``capture`` (e.g. {"af": true}).
+          ``compute_wb``     derive white balance from the chart (default true).
+          ``patch_centers``  24 [x, y] coords to override auto-detection.
+          ``radius``         patch sampling half-width (default 10).
         """
-        img_rgb = await self._acquire_rgb(opts, timeout)
-
-        patch_centers = opts.get("patch_centers")
-        if patch_centers is not None:
-            patch_centers = [(int(x), int(y)) for x, y in patch_centers]
+        raw_path, rgb8 = await self._acquire_calibration_source(opts, timeout)
+        compute_wb = bool(opts.get("compute_wb", True))
         radius = int(opts.get("radius", 10))
+        manual_centers = opts.get("patch_centers")
 
-        corrector = ColorCorrector.calibrate_from_rgb(img_rgb, patch_centers, radius)
-        report = corrector.delta_e_report(img_rgb, patch_centers)
+        # Image used to *locate* the patches. For a RAW we render it unrotated
+        # (user_flip=0) so the centres map straight onto the CFA and the linear
+        # CCM render below.
+        detect_img = render_raw_for_detection(raw_path) if raw_path else rgb8
+
+        if manual_centers is not None:
+            centers = np.array(
+                [(int(x), int(y)) for x, y in manual_centers], dtype=np.float32
+            )
+            neutral_boxes = None
+        else:
+            detection = detect_colorchecker(detect_img)
+            if detection is None:
+                raise ValueError(
+                    "could not auto-detect the ColorChecker; ensure the whole "
+                    "chart is visible and unobstructed, or pass `patch_centers`"
+                )
+            centers = detection["centers"]
+            neutral_boxes = detection["neutral_boxes_norm"]
+
+        # White balance from the raw Bayer/CFA under the neutral patches.
+        wb: Optional[List[float]] = None
+        wb_note: Optional[str] = None
+        if compute_wb:
+            if raw_path and neutral_boxes:
+                wb = compute_raw_wb_multipliers(raw_path, neutral_boxes)
+            elif raw_path:
+                wb_note = (
+                    "skipped: white balance needs auto-detected neutral patches; "
+                    "omit `patch_centers` to enable it"
+                )
+            else:
+                wb_note = (
+                    "skipped: raw-CFA white balance needs a RAW capture - set "
+                    "`use_capture: true` with a RAW source, or pass a RAW `path`"
+                )
+
+        # Fit the CCM on patches developed with the SAME white balance the
+        # captures will use, so the matrix and the WB stay consistent.
+        reference_linear = _srgb_to_linear(REFERENCE_SRGB)
+        if raw_path:
+            linear = load_linear_rgb(
+                raw_path,
+                white_balance=(wb if wb is not None else "camera"),
+                user_flip=0,  # match detect_img so `centers` line up
+            )
+            measured_linear = PatchSampler.sample_linear_at_centers(linear, centers, radius)
+        else:
+            measured_linear = PatchSampler.sample_at_centers(
+                detect_img, [(int(x), int(y)) for x, y in centers], radius
+            )
+
+        ccm = _fit_ccm(measured_linear, reference_linear)
+        corrector = ColorCorrector(ccm)
+
+        def _delta_e_stats(values: np.ndarray) -> Dict[str, float]:
+            d = np.sqrt(np.sum((np.clip(values, 0, 1) - reference_linear) ** 2, axis=1)) * 100
+            return {"mean": float(d.mean()), "max": float(d.max())}
+
+        report = {
+            "before": _delta_e_stats(measured_linear),
+            "after": _delta_e_stats(measured_linear @ ccm.T),
+        }
+
         self.corrector = corrector
+        if wb is not None:
+            # Subsequent capture/develop default to this WB unless overridden.
+            self._white_balance = wb
 
         self.logger.info(
             f"Calibrated CCM (delta-E mean {report['before']['mean']:.1f} -> "
-            f"{report['after']['mean']:.1f}); copy `ccm` into the component "
-            f"config to persist"
+            f"{report['after']['mean']:.1f})"
+            + (f"; white balance [{', '.join(f'{m:.3f}' for m in wb)}]" if wb else "")
+            + "; copy `ccm`"
+            + (" and `white_balance`" if wb else "")
+            + " into the component config to persist"
         )
-        return {
+        result: Dict[str, ValueTypes] = {
             "ccm": corrector.ccm.tolist(),
+            "white_balance": wb,
             "delta_e": report,
         }
+        if wb_note:
+            result["white_balance_note"] = wb_note
+        return result
 
     async def _capture_corrected(
         self, opts: Mapping[str, Any], timeout: Optional[float]
