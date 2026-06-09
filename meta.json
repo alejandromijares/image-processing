@@ -20,7 +20,7 @@
       "short_description": "Download images from a USB-connected camera over PTP (libgphoto2)."
     }
   ],
-  "entrypoint": "run.sh",
+  "entrypoint": "dist/main",
   "first_run": "",
   "build": {
     "build": "./build.sh",

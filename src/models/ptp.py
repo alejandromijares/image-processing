@@ -25,6 +25,10 @@ Two ways to get images out:
               {"name", "path", "mime_type", "saved_to", "size"}. The bytes are
               not base64'd into the response - full-res stills (especially RAW)
               are too large for gRPC, so they move by file path (`saved_to`).
+              Many bodies (notably Canon) write the still to the card themselves
+              and report the capture as a benign libgphoto2 -1 without handing
+              back the path; in that case we wait `capture_settle` seconds for
+              the write to finish and download the newest file on the card.
 
        {"list_files": {}}
            -> enumerate the image files on the camera's storage.
@@ -186,6 +190,30 @@ class PTPSession:
         self.model_name = chosen[0]
         self.port_path = chosen[1]
 
+        # Default capture to the memory card. Some bodies ship set to
+        # "Internal RAM", which makes capture fail or fill up after a few
+        # frames; the card is what we list/download from anyway.
+        self._set_capture_target_card()
+
+    def _set_capture_target_card(self) -> None:
+        """Best-effort: point `capturetarget` at the memory card.
+
+        Not all bodies expose this setting, and it's never fatal if missing,
+        so any libgphoto2 error here is logged and swallowed.
+        """
+        cam = self._camera
+        try:
+            config = cam.get_config()
+            target = config.get_child_by_name("capturetarget")
+            for i in range(target.count_choices()):
+                choice = str(target.get_choice(i))
+                if "card" in choice.lower():
+                    target.set_value(choice)
+                    cam.set_config(config)
+                    return
+        except gp.GPhoto2Error as exc:  # body doesn't expose it; fine
+            LOGGER.debug(f"could not set capturetarget to card: {exc}")
+
     def close(self) -> None:
         if self._camera is not None:
             try:
@@ -241,10 +269,50 @@ class PTPSession:
     # Writes
     # ------------------------------------------------------------------
 
-    def capture(self) -> str:
-        """Trip the shutter; return the new file's full camera path."""
-        file_path = self._cam.capture(gp.GP_CAPTURE_IMAGE)
-        return file_path.folder.rstrip("/") + "/" + file_path.name
+    def capture(self, settle: float = 2.0) -> str:
+        """Fire the shutter and return the new file's full camera path.
+
+        We use ``trigger_capture()`` rather than ``capture(GP_CAPTURE_IMAGE)``:
+        the latter blocks up to ~60s waiting for a FILE_ADDED event that many
+        bodies (notably Canon writing to the card) never send, then raises a
+        generic -1. ``trigger_capture()`` trips the shutter and returns at once.
+
+        After firing we drain the event queue for up to ``settle`` seconds. That
+        gives the body time to finish writing and lets libgphoto2 process events:
+        a body that *does* report the new file hands us its path directly (fast
+        path), and one that writes to the card silently falls through to the
+        newest file on the card.
+        """
+        cam = self._cam
+        try:
+            cam.trigger_capture()
+        except gp.GPhoto2Error as exc:
+            raise RuntimeError(
+                f"camera capture failed (libgphoto2: {exc}). Check autofocus "
+                "(try manual focus or a lit, high-contrast subject), the memory "
+                "card, and that the mode dial allows remote release (use "
+                "P/Av/Tv/M, not movie/bulb)."
+            ) from exc
+
+        step = 500
+        waited = 0
+        deadline = int(settle * 1000)
+        while waited < deadline:
+            event_type, event_data = cam.wait_for_event(step)
+            if event_type == gp.GP_EVENT_FILE_ADDED:
+                return event_data.folder.rstrip("/") + "/" + event_data.name
+            waited += step
+
+        # No path reported - the body wrote it to the card itself. Grab the
+        # newest file there (same as `{"download": {"latest": true}}`).
+        path = self.latest_image_file()
+        if path is None:
+            raise RuntimeError(
+                "capture fired but no image appeared on the card - check "
+                "autofocus (try manual focus or a lit, high-contrast subject), "
+                "the memory card, and that the mode dial allows remote release."
+            )
+        return path
 
     def delete(self, path: str) -> None:
         folder, name = os.path.split(path)
@@ -285,6 +353,12 @@ class PTP(Camera, EasyResource):
         if download_dir is not None and not isinstance(download_dir, str):
             raise ValueError("`download_dir` must be a string path")
 
+        settle = attrs.get("capture_settle")
+        if settle is not None and (
+            not isinstance(settle, (int, float)) or isinstance(settle, bool) or settle < 0
+        ):
+            raise ValueError("`capture_settle` must be a non-negative number of seconds")
+
         return [], []
 
     def reconfigure(
@@ -297,6 +371,11 @@ class PTP(Camera, EasyResource):
         self._model_match: Optional[str] = attrs.get("camera_model") or None
         self._download_dir: Optional[str] = attrs.get("download_dir") or None
         self._delete_after_download: bool = bool(attrs.get("delete_after_download", False))
+        # Seconds to wait after firing for the body to finish writing to the
+        # card before we grab the "latest" file (bodies that don't report the
+        # captured path - e.g. Canon writing to card). Bump it for slow cards
+        # or flash recycle time.
+        self._capture_settle: float = float(attrs.get("capture_settle", 2.0))
 
         if self._download_dir:
             os.makedirs(self._download_dir, exist_ok=True)
@@ -444,7 +523,7 @@ class PTP(Camera, EasyResource):
 
     async def _capture(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
         """Trip the shutter, download the resulting still, return its metadata."""
-        path = await self._run(self._session.capture)
+        path = await self._run(self._session.capture, self._capture_settle)
         self.logger.info(f"captured {path}")
         return await self._read_and_package(path)
 
