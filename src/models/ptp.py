@@ -20,8 +20,11 @@ Two ways to get images out:
 2. DoCommand path - the real PTP workflow:
 
        {"capture": {}}
-           -> trip the shutter, download the resulting full-res still, and
-              return {"image_base64", "mime_type", "name", "path"}.
+           -> trip the shutter, download the resulting full-res still to
+              `download_dir`, and return its metadata
+              {"name", "path", "mime_type", "saved_to", "size"}. The bytes are
+              not base64'd into the response - full-res stills (especially RAW)
+              are too large for gRPC, so they move by file path (`saved_to`).
 
        {"list_files": {}}
            -> enumerate the image files on the camera's storage.
@@ -30,8 +33,8 @@ Two ways to get images out:
 
        {"download": {"path": "/store_00010001/DCIM/100CANON/IMG_042.JPG"}}
        {"download": {"latest": true}}
-           -> download a file (or the newest one) and return it as base64.
-              With a `download_dir` configured, also writes it to disk.
+           -> download a file (or the newest one) to `download_dir` and return
+              the same metadata shape as `capture`.
 
        {"download_all": {"new_only": true}}
            -> download every image (or only new ones) to `download_dir`,
@@ -47,7 +50,6 @@ Two ways to get images out:
 """
 
 import asyncio
-import base64
 import os
 from typing import (
     Any,
@@ -436,13 +438,12 @@ class PTP(Camera, EasyResource):
             "name": name,
             "path": path,
             "mime_type": _mime_for(name),
-            "image_base64": base64.b64encode(data).decode(),
             "saved_to": saved_path,
             "size": len(data),
         }
 
     async def _capture(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
-        """Trip the shutter, download the resulting still, return it as base64."""
+        """Trip the shutter, download the resulting still, return its metadata."""
         path = await self._run(self._session.capture)
         self.logger.info(f"captured {path}")
         return await self._read_and_package(path)

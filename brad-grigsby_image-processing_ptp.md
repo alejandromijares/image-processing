@@ -51,15 +51,18 @@ detected on USB.
 
 ### Capture a still
 
-Trips the shutter, downloads the resulting full-resolution still, and returns it
-as base64.
+Trips the shutter, downloads the resulting full-resolution still to
+`download_dir`, and returns its metadata.
 
 ```json
 { "capture": {} }
 ```
 
-Returns `{"name", "path", "mime_type", "image_base64", "saved_to", "size"}`
-(`saved_to` is `null` unless `download_dir` is set).
+Returns `{"name", "path", "mime_type", "saved_to", "size"}`. `saved_to` is the
+local file path on disk (or `null` if no `download_dir` is configured). The image
+bytes are **not** base64-encoded into the response — full-resolution stills
+(especially RAW) are too large to ship over gRPC, so they move by file path
+instead. Configure `download_dir` and read `saved_to`.
 
 ### List files
 
@@ -79,8 +82,19 @@ Returns `{"files": ["/store_00010001/DCIM/100CANON/IMG_0042.JPG", ...], "count":
 { "download": { "latest": true } }
 ```
 
-Returns the same shape as `capture`. RAW files (`.cr3`, `.nef`, `.arw`, …)
-download fine but come back with `mime_type: "application/octet-stream"`.
+Returns the same shape as `capture` (`name`, `path`, `mime_type`, `saved_to`,
+`size`). RAW files (`.cr3`, `.nef`, `.arw`, …) download fine but report
+`mime_type: "application/octet-stream"`.
+
+### Pairing with color-correction
+
+Set a `download_dir` here and point the `color-correction` model's `camera`
+attribute at this component. When it calls `capture`, this model downloads the
+still to `download_dir` and returns `saved_to`; color-correction reads that file
+from disk, develops the RAW (16-bit, white balance + CCM), and writes the
+exports. Both components must run on the same machine (they share the
+filesystem). See the
+[color-correction docs](brad-grigsby_image-processing_color-correction.md).
 
 ### Download everything to disk
 

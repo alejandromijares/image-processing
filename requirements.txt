@@ -2,4 +2,7 @@ viam-sdk==0.77.0
 typing-extensions
 numpy
 pillow
+rawpy
+tifffile
+opencv-python-headless
 gphoto2; platform_system != "Windows"
