@@ -10,7 +10,7 @@
     {
       "api": "rdk:component:camera",
       "model": "brad-grigsby:image-processing:color-correction",
-      "markdown_link": "README.md#model-brad-grigsbyimage-processingcolor-correction",
+      "markdown_link": "brad-grigsby_image-processing_color-correction.md",
       "short_description": ""
     },
     {
