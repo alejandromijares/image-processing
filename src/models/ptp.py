@@ -235,8 +235,37 @@ class PTPSession:
     def summary(self) -> str:
         return str(self._cam.get_summary().text)
 
+    def refresh(self) -> None:
+        """Drop libgphoto2's cached filesystem so the next read re-scans the card.
+
+        libgphoto2 reads the card's directory listing once at ``init()`` and
+        caches it for the life of the connection. It does *not* reliably update
+        that cache from PTP events, so frames shot - or files deleted - on the
+        body while we're connected won't appear (or clear) until the cache is
+        rebuilt. That's why a module restart "fixes" it: restart re-inits.
+
+        ``gp_camera_exit()`` frees the cached filesystem; the next ``init()``
+        re-reads it. We reuse the same ``Camera`` object and its port binding,
+        so this is a USB re-handshake, not a full re-autodetect. If the
+        re-handshake fails we fall back to a clean reopen.
+        """
+        cam = self._camera
+        if cam is None:
+            return
+        try:
+            cam.exit()
+            cam.init()
+        except gp.GPhoto2Error as exc:
+            LOGGER.debug(f"refresh re-handshake failed ({exc}); reopening")
+            self.close()
+            self.open()
+
     def list_image_files(self, folder: str = "/") -> List[str]:
         """Recursively list image file paths on the camera's storage."""
+        self.refresh()
+        return self._walk_image_files(folder)
+
+    def _walk_image_files(self, folder: str) -> List[str]:
         cam = self._cam
         files: List[str] = []
         for name, _ in cam.folder_list_files(folder):
@@ -244,7 +273,7 @@ class PTPSession:
                 files.append(folder.rstrip("/") + "/" + name)
         for name, _ in cam.folder_list_folders(folder):
             sub = folder.rstrip("/") + "/" + name
-            files.extend(self.list_image_files(sub))
+            files.extend(self._walk_image_files(sub))
         return files
 
     def latest_image_file(self) -> Optional[str]:
