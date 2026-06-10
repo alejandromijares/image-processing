@@ -55,6 +55,7 @@ Two ways to get images out:
 
 import asyncio
 import os
+import time
 from typing import (
     Any,
     ClassVar,
@@ -323,14 +324,20 @@ class PTPSession:
                 "P/Av/Tv/M, not movie/bulb)."
             ) from exc
 
-        step = 500
-        waited = 0
-        deadline = int(settle * 1000)
-        while waited < deadline:
-            event_type, event_data = cam.wait_for_event(step)
+        # Wait by real wall-clock time, not by counting event iterations:
+        # wait_for_event returns *early* on each event, and bodies emit a burst
+        # of non-file events (capture-complete, unknown) right after the shutter
+        # trips. Crediting each of those the full step would blow the whole
+        # settle budget in milliseconds and we'd give up before the card write
+        # finishes. We cap each wait at the time remaining so we never overshoot.
+        deadline = time.monotonic() + settle
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            event_type, event_data = cam.wait_for_event(min(500, int(remaining * 1000) + 1))
             if event_type == gp.GP_EVENT_FILE_ADDED:
                 return event_data.folder.rstrip("/") + "/" + event_data.name
-            waited += step
 
         # No path reported - the body wrote it to the card itself. Grab the
         # newest file there (same as `{"download": {"latest": true}}`).
