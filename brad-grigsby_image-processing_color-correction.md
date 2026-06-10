@@ -63,6 +63,7 @@ installs those automatically on Debian/Ubuntu.
 | `jpeg_quality`   | int          | Optional  | JPEG export quality. Default `95`.                                                      |
 | `white_balance`  | string/array | Optional  | RAW white balance: `camera` (default), `auto`, `daylight`, or `[r,g,b,g2]` multipliers. |
 | `write_sidecar`  | boolean      | Optional  | Write a `<name>.json` sidecar recording the development. Default `true`.                |
+| `part_id`        | string       | Optional  | Machine part to attach `upload`s to. Defaults to `VIAM_MACHINE_PART_ID` from the env.   |
 
 If no `ccm` is given, the component passes images through unchanged (identity
 matrix); the RAW develop still runs (demosaic + export) but applies no color
@@ -158,6 +159,30 @@ Batch several files at once with `paths`:
 A single `path` returns the same shape as `capture` (including a preview). A
 `paths` list returns `{"developed": [ ...per-file results... ], "count": N}`
 with previews omitted to keep the response small.
+
+### Upload to Viam
+
+Uploads files already on disk straight to the Viam cloud, tagged for retrieval —
+so full-resolution RAW/TIFF/JPEG never have to travel back through a browser to
+be saved. Pass every path you want stored together (e.g. all the files sharing a
+capture's stem) and a tag like the SKU.
+
+```json
+{
+  "upload": {
+    "paths": ["/photos/IMG_0042.CR3", "/photos/IMG_0042_16.tif", "/photos/IMG_0042.jpg"],
+    "tags": ["sku:ABC123", "ABC123"]
+  }
+}
+```
+
+Options: `paths` (required), `tags`, `part_id` (override the configured/env part
+id), `component_name` (camera to associate the data with; defaults to this
+component's name). Authentication uses the `VIAM_API_KEY` / `VIAM_API_KEY_ID`
+that Viam injects into the module process — no credentials need configuring, but
+the machine must be cloud-connected. Returns `{"uploaded": [...paths], "count":
+N, "failed": [{"path", "error"}]}` — a failed file is reported but does not abort
+the others.
 
 ## Typical workflows
 

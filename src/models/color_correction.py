@@ -86,8 +86,10 @@ import numpy as np
 from PIL import Image
 from typing_extensions import Self
 
+from viam.app.data_client import DataClient
 from viam.components.camera import Camera
 from viam.media.utils.pil import pil_to_viam_image, viam_to_pil_image
+from viam.rpc.dial import Credentials, DialOptions, _dial_app
 from viam.media.video import CameraMimeType, NamedImage, ViamImage
 from viam.proto.app.robot import ComponentConfig
 from viam.proto.common import Geometry, ResourceName, ResponseMetadata
@@ -567,6 +569,15 @@ class ColorCorrection(Camera, EasyResource):
         self._white_balance = attrs.get("white_balance", "camera")
         self._write_sidecar: bool = bool(attrs.get("write_sidecar", True))
 
+        # The `upload` DoCommand authenticates to the cloud with the API key
+        # Viam injects into every module process (VIAM_API_KEY / VIAM_API_KEY_ID),
+        # so no credentials are configured here. part_id falls back to the
+        # machine's env var. The data client is created lazily and reused.
+        self._part_id: Optional[str] = (
+            attrs.get("part_id") or os.environ.get("VIAM_MACHINE_PART_ID") or None
+        )
+        self._data_client: Optional[DataClient] = None
+
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)
 
@@ -646,9 +657,13 @@ class ColorCorrection(Camera, EasyResource):
         if "develop" in command:
             resp["develop"] = await self._develop(command.get("develop") or {})
 
+        if "upload" in command:
+            resp["upload"] = await self._upload(command.get("upload") or {})
+
         if not resp:
             raise ValueError(
-                "no recognized command; supported: calibrate_color, capture, develop"
+                "no recognized command; supported: calibrate_color, capture, "
+                "develop, upload"
             )
         return resp
 
@@ -1058,6 +1073,97 @@ class ColorCorrection(Camera, EasyResource):
         with open(sidecar_path, "w") as f:
             json.dump(record, f, indent=2)
         return sidecar_path
+
+    async def _get_data_client(self) -> DataClient:
+        """
+        Lazily build (and cache) a cloud ``DataClient`` from the API key Viam
+        injects into the module process (``VIAM_API_KEY`` / ``VIAM_API_KEY_ID``).
+
+        We dial the app channel directly rather than via
+        ``ViamClient.create_from_env_vars``: in viam-sdk 0.77.0 that path
+        authenticates the channel inside ``_dial_app`` and then authenticates a
+        *second* time, which the server rejects with "already authenticated;
+        cannot re-authenticate". ``_dial_app`` alone performs the single, correct
+        auth, and the resulting channel carries the bearer token we hand to the
+        ``DataClient``.
+        """
+        if self._data_client is not None:
+            return self._data_client
+        api_key = os.environ.get("VIAM_API_KEY")
+        api_key_id = os.environ.get("VIAM_API_KEY_ID")
+        if not api_key or not api_key_id:
+            raise ValueError(
+                "`upload` could not authenticate: VIAM_API_KEY / VIAM_API_KEY_ID "
+                "were not present in the module environment. This requires "
+                "running on a cloud-connected machine."
+            )
+        dial_options = DialOptions(
+            credentials=Credentials(type="api-key", payload=api_key),
+            auth_entity=api_key_id,
+        )
+        channel = await _dial_app("app.viam.com", dial_options)
+        metadata = getattr(channel, "_metadata", {})
+        self._data_client = DataClient(channel, metadata)
+        return self._data_client
+
+    async def _upload(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
+        """
+        Upload files already on disk to Viam, tagged for later retrieval.
+
+        The full-resolution captures (CR3 + the rendered TIFF/JPEG exports + the
+        JSON sidecar) live on this machine's filesystem; this ships them straight
+        to the cloud so they never have to travel back through the browser. The
+        webapp passes every path that shares a capture's filename stem, so a
+        single selected shot uploads as a complete set under one SKU tag.
+
+        ``opts``:
+          ``paths``          list of file paths on disk to upload (required)
+          ``tags``           tags to attach to every uploaded file (e.g. SKU)
+          ``part_id``        override the configured / env machine part id
+          ``component_name`` camera name to associate the data with (optional)
+        """
+        raw_paths = opts.get("paths") or []
+        if not raw_paths:
+            raise ValueError("`upload` needs a non-empty `paths` list")
+        paths = [str(p) for p in raw_paths]
+        tags = [str(t) for t in (opts.get("tags") or [])]
+
+        part_id = opts.get("part_id") or self._part_id
+        if not part_id:
+            raise ValueError(
+                "no part id available for upload; set `part_id` in config or pass "
+                "it in the command (VIAM_MACHINE_PART_ID was not set)"
+            )
+        component_name = opts.get("component_name") or self.name
+
+        data_client = await self._get_data_client()
+
+        uploaded: List[str] = []
+        failed: List[Dict[str, str]] = []
+        for path in paths:
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+                ext = os.path.splitext(path)[1]  # e.g. ".cr3", ".tif", ".jpg"
+                await data_client.file_upload(
+                    part_id=str(part_id),
+                    data=data,
+                    file_name=os.path.basename(path),
+                    file_extension=ext,
+                    tags=tags or None,
+                    component_type="rdk:component:camera",
+                    component_name=str(component_name),
+                )
+                uploaded.append(path)
+            except Exception as exc:  # noqa: BLE001 - report per-file, keep going
+                self.logger.error(f"failed to upload {path}: {exc}")
+                failed.append({"path": path, "error": str(exc)})
+
+        self.logger.info(
+            f"uploaded {len(uploaded)}/{len(paths)} file(s)"
+            + (f" with tags {tags}" if tags else "")
+        )
+        return {"uploaded": uploaded, "count": len(uploaded), "failed": failed}
 
     async def get_geometries(
         self, *, extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None
