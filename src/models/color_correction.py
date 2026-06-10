@@ -765,6 +765,13 @@ class ColorCorrection(Camera, EasyResource):
           ``compute_wb``     derive white balance from the chart (default true).
           ``patch_centers``  24 [x, y] coords to override auto-detection.
           ``radius``         patch sampling half-width (default 10).
+
+        Returns ``ccm`` (pure-colour, ~unity-gain), ``white_balance``
+        ([r,g,b,g2] or null), ``exposure_stops`` (the brightness offset the chart
+        implied vs. the reference - pass it back as ``exposure_stops`` on
+        capture/develop to render at the ColorChecker's nominal brightness), and
+        a ``delta_e`` report whose ``after`` figure is exposure-normalised colour
+        accuracy.
         """
         raw_path, rgb8 = await self._acquire_calibration_source(opts, timeout)
         compute_wb = bool(opts.get("compute_wb", True))
@@ -823,17 +830,36 @@ class ColorCorrection(Camera, EasyResource):
                 detect_img, [(int(x), int(y)) for x, y in centers], radius
             )
 
-        ccm = _fit_ccm(measured_linear, reference_linear)
+        # Decouple exposure (a single scalar) from colour (the matrix). The chart
+        # is typically exposed below the reference's nominal brightness; fitting
+        # the CCM directly makes it absorb that gain (diagonal >> 1), which then
+        # brightens *every* developed frame and clips highlights early. Instead we
+        # scale the measured patches so the neutral ramp matches the reference
+        # luminance, fit the CCM on that (keeping it ~unity-gain, pure colour),
+        # and report the implied exposure offset for the caller to dial in via
+        # `exposure_stops`. Neutral 8 / 6.5 / 5 / 3.5 - skip the clip-prone white
+        # and noisy black ends of the ramp.
+        neutral_fit = [19, 20, 21, 22]
+        meas_neutral = measured_linear[neutral_fit].reshape(-1)
+        ref_neutral = reference_linear[neutral_fit].reshape(-1)
+        energy = float(np.dot(meas_neutral, meas_neutral))
+        exposure_scale = float(np.dot(meas_neutral, ref_neutral) / energy) if energy > 0 else 1.0
+        measured_fit = measured_linear * exposure_scale
+
+        ccm = _fit_ccm(measured_fit, reference_linear)
         corrector = ColorCorrector(ccm)
 
         def _delta_e_stats(values: np.ndarray) -> Dict[str, float]:
             d = np.sqrt(np.sum((np.clip(values, 0, 1) - reference_linear) ** 2, axis=1)) * 100
             return {"mean": float(d.mean()), "max": float(d.max())}
 
+        # "after" is exposure-normalised, so it reflects pure colour accuracy
+        # independent of how bright you choose to render (via exposure_stops).
         report = {
             "before": _delta_e_stats(measured_linear),
-            "after": _delta_e_stats(measured_linear @ ccm.T),
+            "after": _delta_e_stats(measured_fit @ ccm.T),
         }
+        exposure_stops = float(np.log2(exposure_scale)) if exposure_scale > 0 else 0.0
 
         self.corrector = corrector
         if wb is not None:
@@ -842,8 +868,8 @@ class ColorCorrection(Camera, EasyResource):
 
         self.logger.info(
             f"Calibrated CCM (delta-E mean {report['before']['mean']:.1f} -> "
-            f"{report['after']['mean']:.1f})"
-            + (f"; white balance [{', '.join(f'{m:.3f}' for m in wb)}]" if wb else "")
+            f"{report['after']['mean']:.1f}, exposure {exposure_stops:+.2f} stops)"
+            + (f"; white balance [{', '.join(f'{v:.3f}' for v in wb)}]" if wb else "")
             + "; copy `ccm`"
             + (" and `white_balance`" if wb else "")
             + " into the component config to persist"
@@ -851,6 +877,7 @@ class ColorCorrection(Camera, EasyResource):
         result: Dict[str, ValueTypes] = {
             "ccm": corrector.ccm.tolist(),
             "white_balance": wb,
+            "exposure_stops": exposure_stops,
             "delta_e": report,
         }
         if wb_note:
