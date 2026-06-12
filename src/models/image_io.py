@@ -185,6 +185,10 @@ def load_linear_rgb(
             rgb16 = raw.postprocess(**kwargs)
         return (np.asarray(rgb16, dtype=np.float32) / 65535.0)
 
+    with Image.open(path) as img:
+        arr = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
+    return srgb_to_linear(arr).astype(np.float32)
+
 
 # ---------------------------------------------------------------------------
 # RAW colour-calibration helpers (ColorChecker white balance + detection)
@@ -306,10 +310,6 @@ def compute_raw_wb_multipliers(
     if not all(np.isfinite(m) for m in wb) or any(m <= 0 for m in wb):
         raise ValueError(f"computed non-physical white-balance multipliers {wb}")
     return [float(m) for m in wb]
-
-    with Image.open(path) as img:
-        arr = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
-    return srgb_to_linear(arr).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------

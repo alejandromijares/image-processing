@@ -439,7 +439,7 @@ class ColorCorrector:
             return img_rgb
         img_linear = _srgb_to_linear(img_rgb.astype(np.float32) / 255.0)
         corrected_srgb = _linear_to_srgb(self.apply_to_linear(img_linear))
-        return (corrected_srgb * 255.0).clip(0, 255).astype(np.uint8)
+        return np.rint(corrected_srgb * 255.0).clip(0, 255).astype(np.uint8)
 
     # ------------------------------------------------------------------
     # Diagnostics
