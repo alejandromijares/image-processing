@@ -69,6 +69,7 @@ config attributes to make the calibration persist across restarts.
 import base64
 import json
 import os
+import time
 from datetime import datetime, timezone
 from io import BytesIO
 from typing import (
@@ -923,15 +924,29 @@ class ColorCorrection(Camera, EasyResource):
         formats = list(opts.get("output_formats", self._output_formats))
         out_dir_override = opts.get("output_dir") or self._output_dir
 
+        start = time.perf_counter()
         source_resp = await self.camera.do_command({"capture": capture_opts}, timeout=timeout)
         capture = source_resp.get("capture", source_resp)
+        self.logger.debug(
+            f"[timing] source camera capture (incl. download): "
+            f"{time.perf_counter() - start:.2f}s"
+        )
 
+        t_decode = time.perf_counter()
         linear, source_path = self._linear_from_capture_response(
             capture, white_balance, exposure_stops
         )
-        return self._develop_one(
+        self.logger.debug(
+            f"[timing] decode to linear RGB (incl. white balance): "
+            f"{time.perf_counter() - t_decode:.2f}s"
+        )
+        result = self._develop_one(
             linear, source_path, white_balance, exposure_stops, formats, out_dir_override
         )
+        self.logger.debug(
+            f"[timing] capture pipeline total: {time.perf_counter() - start:.2f}s"
+        )
+        return result
 
     async def _develop(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
         """
@@ -966,6 +981,7 @@ class ColorCorrection(Camera, EasyResource):
 
         results: List[Mapping[str, ValueTypes]] = []
         for path in paths:
+            t_file = time.perf_counter()
             linear = load_linear_rgb(
                 path, white_balance=white_balance, exposure_stops=exposure_stops
             )
@@ -977,6 +993,10 @@ class ColorCorrection(Camera, EasyResource):
                     # response small; a single develop still returns its preview.
                     include_preview=single,
                 )
+            )
+            self.logger.debug(
+                f"[timing] develop {os.path.basename(path)} total: "
+                f"{time.perf_counter() - t_file:.2f}s"
             )
 
         if single:
@@ -999,7 +1019,11 @@ class ColorCorrection(Camera, EasyResource):
         return the result. ``linear`` is linear-light float RGB; ``source_path``
         is the originating file (or None for an inline base64 capture).
         """
+        t_ccm = time.perf_counter()
         corrected = self.corrector.apply_to_linear(linear)
+        self.logger.debug(
+            f"[timing] apply color correction (CCM): {time.perf_counter() - t_ccm:.2f}s"
+        )
 
         # Exports land alongside the source file unless an output_dir is set.
         out_dir = out_dir_override or (
@@ -1017,8 +1041,13 @@ class ColorCorrection(Camera, EasyResource):
             stem = stem + "_corrected"
         exports: Dict[str, str] = {}
         if out_dir:
+            t_export = time.perf_counter()
             exports = export_renditions(
                 corrected, out_dir, stem, formats, quality=self._jpeg_quality
+            )
+            self.logger.debug(
+                f"[timing] export {len(exports)} format(s): "
+                f"{time.perf_counter() - t_export:.2f}s"
             )
             self.logger.info(f"exported {list(exports)} for {stem} to {out_dir}")
         else:
@@ -1145,6 +1174,7 @@ class ColorCorrection(Camera, EasyResource):
                 with open(path, "rb") as f:
                     data = f.read()
                 ext = os.path.splitext(path)[1]  # e.g. ".cr3", ".tif", ".jpg"
+                t_upload = time.perf_counter()
                 await data_client.file_upload(
                     part_id=str(part_id),
                     data=data,
@@ -1153,6 +1183,10 @@ class ColorCorrection(Camera, EasyResource):
                     tags=tags or None,
                     component_type="rdk:component:camera",
                     component_name=str(component_name),
+                )
+                self.logger.debug(
+                    f"[timing] upload {os.path.basename(path)} "
+                    f"({len(data) / 1e6:.1f} MB): {time.perf_counter() - t_upload:.2f}s"
                 )
                 uploaded.append(path)
             except Exception as exc:  # noqa: BLE001 - report per-file, keep going

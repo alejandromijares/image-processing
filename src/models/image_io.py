@@ -29,10 +29,26 @@ Writer split, because no single library does it all cleanly:
 """
 
 import os
+import time
+from contextlib import contextmanager
 from typing import Dict, List, Optional, Sequence, Union
 
 import numpy as np
 from PIL import Image, ImageCms
+from viam.logging import getLogger
+
+LOGGER = getLogger(__name__)
+
+
+@contextmanager
+def log_duration(logger, label: str):
+    """Debug-log how long the enclosed block took, tagged `[timing]` so the
+    pipeline's step durations are easy to grep out of a debug log."""
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        logger.debug(f"[timing] {label}: {time.perf_counter() - start:.2f}s")
 
 # --- optional, lazily-imported backends ------------------------------------
 # Each is only needed for a subset of formats, so import lazily and raise a
@@ -181,13 +197,17 @@ def load_linear_rgb(
             kwargs["exp_shift"] = float(np.clip(2.0 ** exposure_stops, 0.25, 8.0))
         if user_flip is not None:
             kwargs["user_flip"] = int(user_flip)
-        with rawpy.imread(path) as raw:
-            rgb16 = raw.postprocess(**kwargs)
+        name = os.path.basename(path)
+        size_mb = os.path.getsize(path) / 1e6
+        with log_duration(LOGGER, f"demosaic {name} ({size_mb:.1f} MB) to 16-bit linear"):
+            with rawpy.imread(path) as raw:
+                rgb16 = raw.postprocess(**kwargs)
         return (np.asarray(rgb16, dtype=np.float32) / 65535.0)
 
-    with Image.open(path) as img:
-        arr = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
-    return srgb_to_linear(arr).astype(np.float32)
+    with log_duration(LOGGER, f"decode + linearize {os.path.basename(path)}"):
+        with Image.open(path) as img:
+            arr = np.array(img.convert("RGB"), dtype=np.float32) / 255.0
+        return srgb_to_linear(arr).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -385,7 +405,8 @@ def export_renditions(
     written: Dict[str, str] = {}
     for fmt in formats:
         dest = os.path.join(out_dir, stem + str(EXPORT_FORMATS[fmt]["suffix"]))
-        written[fmt] = _write_one(linear_rgb, dest, fmt, quality)
+        with log_duration(LOGGER, f"export {fmt} -> {os.path.basename(dest)}"):
+            written[fmt] = _write_one(linear_rgb, dest, fmt, quality)
     return written
 
 
@@ -397,9 +418,10 @@ def linear_to_jpeg_base64(linear_rgb: np.ndarray, max_dim: int = 1024, quality: 
     import base64
     from io import BytesIO
 
-    rgb8 = _encode_srgb(linear_rgb, 8)
-    img = Image.fromarray(rgb8)
-    img.thumbnail((max_dim, max_dim))
-    buf = BytesIO()
-    img.save(buf, format="JPEG", quality=quality)
-    return base64.b64encode(buf.getvalue()).decode()
+    with log_duration(LOGGER, "encode base64 JPEG preview"):
+        rgb8 = _encode_srgb(linear_rgb, 8)
+        img = Image.fromarray(rgb8)
+        img.thumbnail((max_dim, max_dim))
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=quality)
+        return base64.b64encode(buf.getvalue()).decode()

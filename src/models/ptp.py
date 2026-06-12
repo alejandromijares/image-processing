@@ -341,8 +341,15 @@ class PTPSession:
     def read_file(self, path: str) -> bytes:
         """Download a single file's bytes by full camera path."""
         folder, name = os.path.split(path)
+        start = time.perf_counter()
         camera_file = self._cam.file_get(folder, name, gp.GP_FILE_TYPE_NORMAL)
-        return bytes(camera_file.get_data_and_size())
+        data = bytes(camera_file.get_data_and_size())
+        elapsed = max(time.perf_counter() - start, 1e-9)
+        LOGGER.debug(
+            f"[timing] download {name} from camera ({len(data) / 1e6:.1f} MB): "
+            f"{elapsed:.2f}s ({len(data) / 1e6 / elapsed:.1f} MB/s)"
+        )
+        return data
 
     @_retry_once_on_device_gone
     def preview(self) -> bytes:
@@ -386,6 +393,7 @@ class PTPSession:
         # Retry only the trigger itself after a reconnect: once the shutter has
         # actually fired, a blind retry would expose a second frame.
         cam = self._cam
+        t_trigger = time.perf_counter()
         try:
             cam.trigger_capture()
         except gp.GPhoto2Error as exc:
@@ -408,6 +416,8 @@ class PTPSession:
         # trips. Crediting each of those the full step would blow the whole
         # settle budget in milliseconds and we'd give up before the card write
         # finishes. We cap each wait at the time remaining so we never overshoot.
+        LOGGER.debug(f"[timing] shutter trigger: {time.perf_counter() - t_trigger:.2f}s")
+        t_settle = time.perf_counter()
         deadline = time.monotonic() + settle
         while True:
             remaining = deadline - time.monotonic()
@@ -415,11 +425,21 @@ class PTPSession:
                 break
             event_type, event_data = cam.wait_for_event(min(500, int(remaining * 1000) + 1))
             if event_type == gp.GP_EVENT_FILE_ADDED:
+                LOGGER.debug(
+                    f"[timing] camera reported new file after "
+                    f"{time.perf_counter() - t_settle:.2f}s of settle wait"
+                )
                 return event_data.folder.rstrip("/") + "/" + event_data.name
 
         # No path reported - the body wrote it to the card itself. Grab the
         # newest file there (same as `{"download": {"latest": true}}`).
+        LOGGER.debug(
+            f"[timing] no file event within the {settle:.1f}s settle window; "
+            "scanning card for the newest file"
+        )
+        t_scan = time.perf_counter()
         path = self.latest_image_file()
+        LOGGER.debug(f"[timing] card scan for newest file: {time.perf_counter() - t_scan:.2f}s")
         if path is None:
             raise RuntimeError(
                 "capture fired but no image appeared on the card - check "
@@ -522,8 +542,13 @@ class PTP(Camera, EasyResource):
         if not self._download_dir:
             return None
         dest = os.path.join(self._download_dir, name)
+        start = time.perf_counter()
         with open(dest, "wb") as f:
             f.write(data)
+        self.logger.debug(
+            f"[timing] write {name} to {self._download_dir}: "
+            f"{time.perf_counter() - start:.2f}s"
+        )
         return dest
 
     # ------------------------------------------------------------------
@@ -638,9 +663,22 @@ class PTP(Camera, EasyResource):
 
     async def _capture(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
         """Trip the shutter, download the resulting still, return its metadata."""
+        start = time.perf_counter()
         path = await self._run(self._session.capture, self._capture_settle)
+        self.logger.debug(
+            f"[timing] capture image (trigger + settle): {time.perf_counter() - start:.2f}s"
+        )
         self.logger.info(f"captured {path}")
-        return await self._read_and_package(path)
+        t_package = time.perf_counter()
+        result = await self._read_and_package(path)
+        self.logger.debug(
+            f"[timing] download + save {os.path.basename(path)}: "
+            f"{time.perf_counter() - t_package:.2f}s"
+        )
+        self.logger.debug(
+            f"[timing] capture do_command total: {time.perf_counter() - start:.2f}s"
+        )
+        return result
 
     async def _download(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
         """Download one file by `path`, or the newest with `latest: true`."""
