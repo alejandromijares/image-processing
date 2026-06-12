@@ -303,6 +303,7 @@ def _component(source, output_dir=None):
     cc._write_sidecar = False
     cc._part_id = None
     cc._data_client = None
+    cc._delete_after_upload = False
     cc._pending_captures = {}
     cc._capture_seq = 0
     return cc
@@ -466,3 +467,129 @@ def test_chunked_upload_empty_file_sends_one_chunk(tmp_path):
     chunk_msg, chunk_end = client.sent[1]
     assert chunk_msg.file_contents.data == b""
     assert chunk_end is True
+
+
+# ---------------------------------------------------------------------------
+# Local-disk cleanup: nothing else in the pipeline ever deletes a local file,
+# so the download dir grows by every frame shot. `delete` removes skipped
+# captures (guarded to output_dir); `delete_after_upload` removes each file
+# once it is confirmed in the cloud.
+# ---------------------------------------------------------------------------
+
+
+def _uploader_component(tmp_path, monkeypatch, fail_paths=()):
+    """Component with upload wired to a fake cloud; uploads of `fail_paths` fail."""
+    cc = _component(_FakeSource(None), output_dir=str(tmp_path))
+    cc._part_id = "part-1"
+
+    async def fake_get_data_client():
+        return _FakeDataClient()
+
+    async def fake_upload_chunked(client, path, **kwargs):
+        if path in fail_paths:
+            raise RuntimeError("simulated upload failure")
+        return "fake-binary-id"
+
+    monkeypatch.setattr(cc, "_get_data_client", fake_get_data_client)
+    monkeypatch.setattr(ColorCorrection, "_file_upload_chunked",
+                        staticmethod(fake_upload_chunked))
+    return cc
+
+
+def test_upload_keeps_files_by_default(tmp_path, monkeypatch):
+    path = tmp_path / "a.CR3"
+    path.write_bytes(b"raw")
+    cc = _uploader_component(tmp_path, monkeypatch)
+
+    out = asyncio.run(cc._upload({"paths": [str(path)]}))
+    assert out["uploaded"] == [str(path)]
+    assert out["deleted"] == []
+    assert path.exists()
+
+
+def test_delete_after_upload_removes_only_successful(tmp_path, monkeypatch):
+    """Uploaded files are deleted; a failed upload keeps its file for retry."""
+    ok = tmp_path / "a.CR3"
+    bad = tmp_path / "b.CR3"
+    ok.write_bytes(b"raw")
+    bad.write_bytes(b"raw")
+    cc = _uploader_component(tmp_path, monkeypatch, fail_paths=(str(bad),))
+    cc._delete_after_upload = True
+
+    out = asyncio.run(cc._upload({"paths": [str(ok), str(bad)]}))
+    assert out["uploaded"] == [str(ok)]
+    assert out["deleted"] == [str(ok)]
+    assert [f["path"] for f in out["failed"]] == [str(bad)]
+    assert not ok.exists()
+    assert bad.exists()
+
+
+def test_delete_after_upload_command_overrides_config(tmp_path, monkeypatch):
+    path = tmp_path / "a.CR3"
+    path.write_bytes(b"raw")
+    cc = _uploader_component(tmp_path, monkeypatch)  # config default: keep
+
+    out = asyncio.run(
+        cc._upload({"paths": [str(path)], "delete_after_upload": True})
+    )
+    assert out["deleted"] == [str(path)]
+    assert not path.exists()
+
+
+def test_delete_removes_files_inside_output_dir(tmp_path):
+    cc = _component(_FakeSource(None), output_dir=str(tmp_path))
+    keep = tmp_path / "keep.CR3"
+    drop = tmp_path / "drop.CR3"
+    keep.write_bytes(b"raw")
+    drop.write_bytes(b"raw")
+
+    out = asyncio.run(cc.do_command({"delete": {"paths": [str(drop)]}}))["delete"]
+    assert out["deleted"] == [str(drop)]
+    assert out["count"] == 1
+    assert not drop.exists()
+    assert keep.exists()
+
+
+def test_delete_missing_file_is_idempotent(tmp_path):
+    cc = _component(_FakeSource(None), output_dir=str(tmp_path))
+    gone = str(tmp_path / "already-gone.CR3")
+
+    out = asyncio.run(cc.do_command({"delete": {"paths": [gone]}}))["delete"]
+    assert out["deleted"] == []
+    assert out["missing"] == [gone]
+    assert out["failed"] == []
+
+
+def test_delete_refuses_paths_outside_output_dir(tmp_path):
+    """Absolute paths, `..` traversal, and symlinks out of output_dir are all
+    refused - the command must not be able to reach the rest of the host."""
+    images = tmp_path / "images"
+    images.mkdir()
+    outside = tmp_path / "secret.txt"
+    outside.write_bytes(b"important")
+    link = images / "sneaky.CR3"
+    link.symlink_to(outside)
+    cc = _component(_FakeSource(None), output_dir=str(images))
+
+    out = asyncio.run(cc.do_command({"delete": {"paths": [
+        str(outside),
+        str(images / ".." / "secret.txt"),
+        str(link),
+    ]}}))["delete"]
+
+    assert out["deleted"] == []
+    assert len(out["failed"]) == 3
+    assert all("outside output_dir" in f["error"] for f in out["failed"])
+    assert outside.exists()
+
+
+def test_delete_requires_output_dir(tmp_path):
+    cc = _component(_FakeSource(None), output_dir=None)
+    with pytest.raises(ValueError, match="output_dir"):
+        asyncio.run(cc.do_command({"delete": {"paths": ["/anything"]}}))
+
+
+def test_delete_requires_paths(tmp_path):
+    cc = _component(_FakeSource(None), output_dir=str(tmp_path))
+    with pytest.raises(ValueError, match="paths"):
+        asyncio.run(cc.do_command({"delete": {}}))

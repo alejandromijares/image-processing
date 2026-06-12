@@ -49,7 +49,8 @@ Two ways to get corrected images out of this component:
 
    Relevant config attributes: ``output_dir`` (default: next to the source),
    ``output_formats`` (default ["tiff16", "jpeg", "png16", "png8"]),
-   ``jpeg_quality`` (95), ``white_balance`` ("camera"), ``write_sidecar`` (true).
+   ``jpeg_quality`` (95), ``white_balance`` ("camera"), ``write_sidecar`` (true),
+   ``delete_after_upload`` (false).
 
        {"develop": {"path": "/photos/IMG_0042.CR3"}}
        {"develop": {"paths": ["/photos/a.CR3", "/photos/b.CR3"]}}
@@ -58,6 +59,14 @@ Two ways to get corrected images out of this component:
               white_balance / exposure_stops / output_formats / output_dir
               options as ``capture``. A single ``path`` returns that file's
               result; ``paths`` returns {"developed": [...], "count": N}.
+
+       {"delete": {"paths": ["/photos/a.CR3", "/photos/a.jpg"]}}
+           -> remove files from this machine's disk: skipped captures the
+              operator discarded, or sets already safe in the cloud. Guarded -
+              only files inside the configured ``output_dir`` can be deleted.
+              For kept shots, prefer ``delete_after_upload`` (config attribute
+              or per-``upload`` option), which removes each file only after
+              its upload succeeds.
 
 Calibration:
 
@@ -723,6 +732,11 @@ class ColorCorrection(Camera, EasyResource):
         self._white_balance = attrs.get("white_balance", "camera")
         self._write_sidecar: bool = bool(attrs.get("write_sidecar", True))
 
+        # Local-disk hygiene, mirroring ptp's `delete_after_download`: once a
+        # file is confirmed in the cloud, the local copy is redundant. Files
+        # that fail to upload are kept for retry.
+        self._delete_after_upload: bool = bool(attrs.get("delete_after_upload", False))
+
         # The `upload` DoCommand authenticates to the cloud with the API key
         # Viam injects into every module process (VIAM_API_KEY / VIAM_API_KEY_ID),
         # so no credentials are configured here. part_id falls back to the
@@ -827,10 +841,13 @@ class ColorCorrection(Camera, EasyResource):
         if "upload" in command:
             resp["upload"] = await self._upload(command.get("upload") or {})
 
+        if "delete" in command:
+            resp["delete"] = self._delete_local(command.get("delete") or {})
+
         if not resp:
             raise ValueError(
                 "no recognized command; supported: calibrate_color, capture, "
-                "capture_result, develop, upload"
+                "capture_result, develop, upload, delete"
             )
         return resp
 
@@ -1479,16 +1496,20 @@ class ColorCorrection(Camera, EasyResource):
         single selected shot uploads as a complete set under one SKU tag.
 
         ``opts``:
-          ``paths``          list of file paths on disk to upload (required)
-          ``tags``           tags to attach to every uploaded file (e.g. SKU)
-          ``part_id``        override the configured / env machine part id
-          ``component_name`` camera name to associate the data with (optional)
+          ``paths``               list of file paths on disk to upload (required)
+          ``tags``                tags to attach to every uploaded file (e.g. SKU)
+          ``part_id``             override the configured / env machine part id
+          ``component_name``      camera name to associate the data with (optional)
+          ``delete_after_upload`` override the config attribute: remove each
+                                  local file once its upload succeeds (failed
+                                  uploads keep their files for retry)
         """
         raw_paths = opts.get("paths") or []
         if not raw_paths:
             raise ValueError("`upload` needs a non-empty `paths` list")
         paths = [str(p) for p in raw_paths]
         tags = [str(t) for t in (opts.get("tags") or [])]
+        delete_after = bool(opts.get("delete_after_upload", self._delete_after_upload))
 
         part_id = opts.get("part_id") or self._part_id
         if not part_id:
@@ -1502,6 +1523,7 @@ class ColorCorrection(Camera, EasyResource):
 
         uploaded: List[str] = []
         failed: List[Dict[str, str]] = []
+        deleted: List[str] = []
         for path in paths:
             try:
                 size = os.path.getsize(path)
@@ -1521,12 +1543,88 @@ class ColorCorrection(Camera, EasyResource):
             except Exception as exc:  # noqa: BLE001 - report per-file, keep going
                 self.logger.error(f"failed to upload {path}: {exc}")
                 failed.append({"path": path, "error": str(exc)})
+                continue
+            if delete_after:
+                try:
+                    os.remove(path)
+                    deleted.append(path)
+                except OSError as exc:
+                    # The upload itself succeeded - don't let a cleanup
+                    # hiccup mark the file as failed.
+                    self.logger.warning(f"uploaded but could not delete {path}: {exc}")
 
         self.logger.info(
             f"uploaded {len(uploaded)}/{len(paths)} file(s)"
             + (f" with tags {tags}" if tags else "")
+            + (f", deleted {len(deleted)} local cop(ies)" if delete_after else "")
         )
-        return {"uploaded": uploaded, "count": len(uploaded), "failed": failed}
+        return {
+            "uploaded": uploaded,
+            "count": len(uploaded),
+            "failed": failed,
+            "deleted": deleted,
+        }
+
+    def _delete_local(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
+        """
+        Delete files from this machine's disk - the cleanup half of the studio
+        flow. Captures the operator skipped (never developed or uploaded) have
+        no other exit path and would otherwise accumulate in the download dir
+        forever; the webapp sends their paths here at submit time.
+
+        Guarded: only files inside the configured ``output_dir`` may be
+        deleted, so a caller can't reach arbitrary paths on the host. Requires
+        ``output_dir`` to be set (without it there is no boundary to enforce).
+
+        ``opts``:
+          ``paths``  list of file paths to delete (required)
+
+        Already-missing files are reported in ``missing`` rather than treated
+        as errors, so retried cleanups stay idempotent.
+        """
+        raw_paths = opts.get("paths") or []
+        if not raw_paths:
+            raise ValueError("`delete` needs a non-empty `paths` list")
+        if not self._output_dir:
+            raise ValueError(
+                "`delete` requires `output_dir` to be configured: it only "
+                "removes files inside that directory"
+            )
+        root = os.path.realpath(self._output_dir)
+
+        deleted: List[str] = []
+        missing: List[str] = []
+        failed: List[Dict[str, str]] = []
+        for raw in raw_paths:
+            path = str(raw)
+            # realpath also resolves symlinks, so a link inside output_dir
+            # pointing elsewhere can't smuggle a delete outside the boundary.
+            real = os.path.realpath(path)
+            if os.path.commonpath([real, root]) != root:
+                self.logger.warning(f"refusing to delete outside output_dir: {path}")
+                failed.append(
+                    {"path": path, "error": f"outside output_dir {self._output_dir}"}
+                )
+                continue
+            try:
+                os.remove(real)
+                deleted.append(path)
+            except FileNotFoundError:
+                missing.append(path)
+            except OSError as exc:
+                self.logger.error(f"failed to delete {path}: {exc}")
+                failed.append({"path": path, "error": str(exc)})
+
+        self.logger.info(
+            f"deleted {len(deleted)}/{len(raw_paths)} local file(s)"
+            + (f", {len(missing)} already gone" if missing else "")
+        )
+        return {
+            "deleted": deleted,
+            "count": len(deleted),
+            "missing": missing,
+            "failed": failed,
+        }
 
     @staticmethod
     async def _file_upload_chunked(

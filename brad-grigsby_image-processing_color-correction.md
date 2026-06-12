@@ -64,6 +64,7 @@ installs those automatically on Debian/Ubuntu.
 | `white_balance`  | string/array | Optional  | RAW white balance: `camera` (default), `auto`, `daylight`, or `[r,g,b,g2]` multipliers. |
 | `write_sidecar`  | boolean      | Optional  | Write a `<name>.json` sidecar recording the development. Default `true`.                |
 | `part_id`        | string       | Optional  | Machine part to attach `upload`s to. Defaults to `VIAM_MACHINE_PART_ID` from the env.   |
+| `delete_after_upload` | boolean | Optional  | Remove each local file once its `upload` succeeds (failed uploads keep their files for retry). Default `false`. |
 
 If no `ccm` is given, the component passes images through unchanged (identity
 matrix); the RAW develop still runs (demosaic + export) but applies no color
@@ -178,11 +179,28 @@ capture's stem) and a tag like the SKU.
 
 Options: `paths` (required), `tags`, `part_id` (override the configured/env part
 id), `component_name` (camera to associate the data with; defaults to this
-component's name). Authentication uses the `VIAM_API_KEY` / `VIAM_API_KEY_ID`
+component's name), `delete_after_upload` (override the config attribute).
+Authentication uses the `VIAM_API_KEY` / `VIAM_API_KEY_ID`
 that Viam injects into the module process — no credentials need configuring, but
 the machine must be cloud-connected. Returns `{"uploaded": [...paths], "count":
-N, "failed": [{"path", "error"}]}` — a failed file is reported but does not abort
-the others.
+N, "failed": [{"path", "error"}], "deleted": [...paths]}` — a failed file is
+reported but does not abort the others, and is never deleted locally.
+
+### Delete local files
+
+Removes files from the machine's disk — skipped captures that were never
+uploaded, or sets already confirmed in the cloud. Nothing else in the pipeline
+deletes local files, so without this (or `delete_after_upload`) the download
+directory grows by every frame ever shot.
+
+```json
+{ "delete": { "paths": ["/photos/IMG_0041.CR3"] } }
+```
+
+Guarded: requires `output_dir` to be configured, and only files inside it can
+be deleted (symlinks are resolved before the check). Returns `{"deleted":
+[...], "count": N, "missing": [...], "failed": [{"path", "error"}]}` —
+already-missing files land in `missing`, so retrying a cleanup is harmless.
 
 ## Typical workflows
 
