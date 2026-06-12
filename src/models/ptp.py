@@ -54,6 +54,7 @@ Two ways to get images out:
 """
 
 import asyncio
+import functools
 import os
 import time
 from typing import (
@@ -112,6 +113,46 @@ def _mime_for(name: str) -> str:
     # RAW and anything unknown is opaque to us; label it generically so callers
     # know it's bytes-on-the-wire, not a previewable JPEG.
     return _EXT_TO_MIME.get(ext, "application/octet-stream")
+
+
+def _device_gone(exc: Exception) -> bool:
+    """True if a libgphoto2 error means the camera vanished from USB.
+
+    Bodies auto-power-off after a few idle minutes (and cables get pulled);
+    from then on the session's handle is stale and every call fails with one of
+    these codes until the connection is rebuilt.
+    """
+    if gp is None or not isinstance(exc, gp.GPhoto2Error):
+        return False
+    return getattr(exc, "code", None) in (
+        gp.GP_ERROR_IO_USB_FIND,   # -52: device no longer on the port
+        gp.GP_ERROR_IO_USB_CLAIM,  # -53: can't claim the interface
+        gp.GP_ERROR_IO,            # -7:  I/O broke mid-conversation
+    )
+
+
+def _retry_once_on_device_gone(method):
+    """Reconnect and retry a ``PTPSession`` method once if the camera vanished.
+
+    Safe only for idempotent operations (reads, deletes): ``capture`` does its
+    own recovery around the shutter trigger so a frame is never fired twice.
+    The retry runs against a fresh connection; if the camera is still absent,
+    ``reconnect`` raises the clear "no PTP camera detected" error instead.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except Exception as exc:
+            if not _device_gone(exc):
+                raise
+            LOGGER.warning(
+                f"camera unreachable during {method.__name__} ({exc}); "
+                "reconnecting and retrying once"
+            )
+            self.reconnect()
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 class PTPSession:
@@ -223,6 +264,16 @@ class PTPSession:
                 pass
             self._camera = None
 
+    def reconnect(self) -> None:
+        """Drop a stale connection and re-open from scratch (re-autodetect).
+
+        Used after the camera vanishes from USB (auto power-off, replug): the
+        old handle is unusable, and unlike ``refresh`` the device may have come
+        back on a different port address, so a full ``open()`` is required.
+        """
+        self.close()
+        self.open()
+
     @property
     def _cam(self):
         if self._camera is None:
@@ -233,6 +284,7 @@ class PTPSession:
     # Reads
     # ------------------------------------------------------------------
 
+    @_retry_once_on_device_gone
     def summary(self) -> str:
         return str(self._cam.get_summary().text)
 
@@ -261,6 +313,7 @@ class PTPSession:
             self.close()
             self.open()
 
+    @_retry_once_on_device_gone
     def list_image_files(self, folder: str = "/") -> List[str]:
         """Recursively list image file paths on the camera's storage."""
         self.refresh()
@@ -284,12 +337,14 @@ class PTPSession:
         # (DCIM/100CANON/IMG_0001 ...). Good enough to pick "newest".
         return sorted(files)[-1] if files else None
 
+    @_retry_once_on_device_gone
     def read_file(self, path: str) -> bytes:
         """Download a single file's bytes by full camera path."""
         folder, name = os.path.split(path)
         camera_file = self._cam.file_get(folder, name, gp.GP_FILE_TYPE_NORMAL)
         return bytes(camera_file.get_data_and_size())
 
+    @_retry_once_on_device_gone
     def preview(self) -> bytes:
         """Grab a single live-view preview frame (JPEG bytes)."""
         camera_file = self._cam.capture_preview()
@@ -313,16 +368,39 @@ class PTPSession:
         path), and one that writes to the card silently falls through to the
         newest file on the card.
         """
-        cam = self._cam
-        try:
-            cam.trigger_capture()
-        except gp.GPhoto2Error as exc:
-            raise RuntimeError(
+        def _capture_error(exc: Exception) -> RuntimeError:
+            if _device_gone(exc):
+                return RuntimeError(
+                    f"camera not reachable on USB (libgphoto2: {exc}); it has "
+                    "likely auto-powered off to sleep or been unplugged - wake "
+                    "it (half-press the shutter), check the cable, and consider "
+                    "disabling auto power-off for tethered work."
+                )
+            return RuntimeError(
                 f"camera capture failed (libgphoto2: {exc}). Check autofocus "
                 "(try manual focus or a lit, high-contrast subject), the memory "
                 "card, and that the mode dial allows remote release (use "
                 "P/Av/Tv/M, not movie/bulb)."
-            ) from exc
+            )
+
+        # Retry only the trigger itself after a reconnect: once the shutter has
+        # actually fired, a blind retry would expose a second frame.
+        cam = self._cam
+        try:
+            cam.trigger_capture()
+        except gp.GPhoto2Error as exc:
+            if not _device_gone(exc):
+                raise _capture_error(exc) from exc
+            LOGGER.warning(
+                f"camera unreachable at capture ({exc}); reconnecting and "
+                "retrying once"
+            )
+            self.reconnect()
+            cam = self._cam
+            try:
+                cam.trigger_capture()
+            except gp.GPhoto2Error as exc2:
+                raise _capture_error(exc2) from exc2
 
         # Wait by real wall-clock time, not by counting event iterations:
         # wait_for_event returns *early* on each event, and bodies emit a burst
@@ -350,6 +428,7 @@ class PTPSession:
             )
         return path
 
+    @_retry_once_on_device_gone
     def delete(self, path: str) -> None:
         folder, name = os.path.split(path)
         self._cam.file_delete(folder, name)
