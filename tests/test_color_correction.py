@@ -14,6 +14,7 @@ from models.color_correction import (
     ColorCorrector,
     PatchSampler,
     _fit_ccm,
+    _neutral_brightness_report,
     _order_corners,
 )
 from models.image_io import linear_to_srgb, srgb_to_linear
@@ -163,6 +164,29 @@ def test_calibrate_from_rgb_corrects_a_cast():
     ref8 = (REFERENCE_SRGB * 255.0).round()
     sampled = np.array([corrected[y, x] for x, y in centers], dtype=np.float32)
     assert np.abs(sampled - ref8).mean() < 3.0
+
+
+def test_neutral_brightness_report_at_nominal_matches_reference():
+    """Patches measured at exactly the reference colors read back the
+    reference 0-255 values (e.g. Neutral 6.5 -> 160)."""
+    report = _neutral_brightness_report(srgb_to_linear(REFERENCE_SRGB))
+    assert set(report) == {
+        "white_9_5", "neutral_8", "neutral_6_5", "neutral_5", "neutral_3_5", "black_2"
+    }
+    for patch in report.values():
+        assert patch["measured"] == pytest.approx(patch["reference"], abs=0.5)
+    assert report["neutral_6_5"]["reference"] == pytest.approx(160.0, abs=0.5)
+
+
+def test_neutral_brightness_report_tracks_light_power():
+    """A one-stop-under chart reads darker than reference on every patch -
+    the readout the user watches while dialing flash power."""
+    under = srgb_to_linear(REFERENCE_SRGB) * 0.5
+    report = _neutral_brightness_report(under)
+    for patch in report.values():
+        assert patch["measured"] < patch["reference"]
+    # Half the linear light on Neutral 6.5 (0.353 linear) lands around sRGB 117.
+    assert 110 < report["neutral_6_5"]["measured"] < 125
 
 
 # ---------------------------------------------------------------------------
@@ -348,3 +372,97 @@ def test_preview_only_capture_skips_exports(tmp_path):
     assert out["exports"] == {}
     assert out["image_base64"]
     assert out["source_path"] == source.saved_path
+
+
+# ---------------------------------------------------------------------------
+# Chunked file upload: app.viam.com caps gRPC messages at 32 MiB, so `upload`
+# must stream files in pieces rather than one message per file (which is what
+# the SDK's `file_upload` does, silently dropping every CR3/TIFF). Exercised
+# against a fake FileUpload stream - no cloud.
+# ---------------------------------------------------------------------------
+
+from types import SimpleNamespace
+
+from viam.proto.app.datasync import FileUploadResponse
+
+from models.color_correction import UPLOAD_CHUNK_BYTES
+
+
+class _FakeUploadStream:
+    """Records every (request, end) pair sent over the FileUpload stream."""
+
+    def __init__(self, sent):
+        self.sent = sent
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def send_message(self, msg, end=False):
+        self.sent.append((msg, end))
+
+    async def recv_message(self):
+        return FileUploadResponse(binary_data_id="fake-binary-id")
+
+
+class _FakeDataClient:
+    def __init__(self):
+        self.sent = []
+        self._metadata = {"authorization": "Bearer fake"}
+        self._data_sync_client = SimpleNamespace(
+            FileUpload=SimpleNamespace(
+                open=lambda metadata=None: _FakeUploadStream(self.sent)
+            )
+        )
+
+
+def test_chunked_upload_splits_large_file(tmp_path):
+    """A file larger than one chunk goes out as metadata + several FileData
+    messages, each under the cap, reassembling to the original bytes."""
+    payload = bytes(range(256)) * ((2 * UPLOAD_CHUNK_BYTES + 1234) // 256 + 1)
+    path = tmp_path / "big.tif"
+    path.write_bytes(payload)
+
+    client = _FakeDataClient()
+    binary_id = asyncio.run(
+        ColorCorrection._file_upload_chunked(
+            client, str(path),
+            part_id="part-1", component_name="cc", tags=["sku:123"],
+        )
+    )
+
+    assert binary_id == "fake-binary-id"
+    meta_msg, meta_end = client.sent[0]
+    assert meta_msg.metadata.file_name == "big.tif"
+    assert meta_msg.metadata.file_extension == ".tif"
+    assert list(meta_msg.metadata.tags) == ["sku:123"]
+    assert meta_end is False
+
+    chunks = [msg.file_contents.data for msg, _ in client.sent[1:]]
+    assert len(chunks) > 1
+    assert all(len(c) <= UPLOAD_CHUNK_BYTES for c in chunks)
+    assert b"".join(chunks) == payload
+    # Only the final message closes the stream.
+    ends = [end for _, end in client.sent[1:]]
+    assert ends == [False] * (len(ends) - 1) + [True]
+
+
+def test_chunked_upload_empty_file_sends_one_chunk(tmp_path):
+    """An empty file still sends one (empty) FileData message, matching the
+    SDK's behavior, so the stream is closed properly."""
+    path = tmp_path / "empty.json"
+    path.write_bytes(b"")
+
+    client = _FakeDataClient()
+    asyncio.run(
+        ColorCorrection._file_upload_chunked(
+            client, str(path), part_id="p", component_name="cc", tags=None,
+        )
+    )
+
+    assert len(client.sent) == 2  # metadata + one empty chunk
+    chunk_msg, chunk_end = client.sent[1]
+    assert chunk_msg.file_contents.data == b""
+    assert chunk_end is True

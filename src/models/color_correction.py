@@ -107,6 +107,13 @@ from viam.components.camera import Camera
 from viam.media.utils.pil import pil_to_viam_image, viam_to_pil_image
 from viam.rpc.dial import Credentials, DialOptions, _dial_app
 from viam.media.video import CameraMimeType, NamedImage, ViamImage
+from viam.proto.app.datasync import (
+    DataType,
+    FileData,
+    FileUploadRequest,
+    FileUploadResponse,
+    UploadMetadata,
+)
 from viam.proto.app.robot import ComponentConfig
 from viam.proto.common import Geometry, ResourceName, ResponseMetadata
 from viam.resource.base import ResourceBase
@@ -140,6 +147,12 @@ except Exception as exc:  # pragma: no cover - depends on the host
 # Default delivery set when `output_formats` isn't configured. Override in
 # config to trim it (e.g. just ["tiff16", "jpeg"] for a master + proof).
 DEFAULT_OUTPUT_FORMATS = ["tiff16", "jpeg", "png16", "png8"]
+
+# app.viam.com rejects gRPC messages over 32 MiB, and the SDK's `file_upload`
+# ships the whole file as a single message - too small for a CR3 (~53 MB) or a
+# 16-bit TIFF (~250 MB). The FileUpload RPC is client-streaming, so we send
+# the file ourselves in chunks safely under that cap.
+UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 # ---------------------------------------------------------------------------
 # ColorChecker Classic reference values (24 patches, sRGB, D50 illuminant)
@@ -183,6 +196,36 @@ REFERENCE_SRGB = np.array([
 # and the color math agree exactly; aliased here to keep call sites readable.
 _srgb_to_linear = srgb_to_linear
 _linear_to_srgb = linear_to_srgb
+
+
+# Row-4 neutral ramp: name -> index into REFERENCE_SRGB / the 24 sampled patches.
+_NEUTRAL_PATCHES = {
+    "white_9_5": 18,
+    "neutral_8": 19,
+    "neutral_6_5": 20,
+    "neutral_5": 21,
+    "neutral_3_5": 22,
+    "black_2": 23,
+}
+
+
+def _neutral_brightness_report(measured_linear: np.ndarray) -> Dict[str, Dict[str, float]]:
+    """
+    As-shot brightness of each neutral patch as an sRGB-encoded 0-255 value -
+    the same readout a grey-card picker (e.g. Capture One's) shows. ``measured``
+    is the white-balanced value straight off the sensor with no exposure
+    compensation, so it responds directly to light power: adjust the flash
+    until ``measured`` matches ``reference`` (at which point ``exposure_stops``
+    lands near 0) instead of changing camera exposure or digital gain.
+    """
+    report: Dict[str, Dict[str, float]] = {}
+    for name, idx in _NEUTRAL_PATCHES.items():
+        measured = _linear_to_srgb(np.clip(measured_linear[idx], 0.0, 1.0))
+        report[name] = {
+            "measured": round(float(np.mean(measured)) * 255.0, 1),
+            "reference": round(float(np.mean(REFERENCE_SRGB[idx])) * 255.0, 1),
+        }
+    return report
 
 
 def _fit_ccm(measured: np.ndarray, reference: np.ndarray) -> np.ndarray:
@@ -911,9 +954,12 @@ class ColorCorrection(Camera, EasyResource):
         Returns ``ccm`` (pure-colour, ~unity-gain), ``white_balance``
         ([r,g,b,g2] or null), ``exposure_stops`` (the brightness offset the chart
         implied vs. the reference - pass it back as ``exposure_stops`` on
-        capture/develop to render at the ColorChecker's nominal brightness), and
-        a ``delta_e`` report whose ``after`` figure is exposure-normalised colour
-        accuracy.
+        capture/develop to render at the ColorChecker's nominal brightness),
+        ``neutral_brightness`` (as-shot 0-255 sRGB picker readout per neutral
+        patch with its reference target - adjust the light power until measured
+        matches reference to hit nominal brightness without touching camera
+        exposure), and a ``delta_e`` report whose ``after`` figure is
+        exposure-normalised colour accuracy.
         """
         raw_path, rgb8 = await self._acquire_calibration_source(opts, timeout)
         compute_wb = bool(opts.get("compute_wb", True))
@@ -1005,6 +1051,7 @@ class ColorCorrection(Camera, EasyResource):
             "after": _delta_e_stats(measured_fit @ ccm.T),
         }
         exposure_stops = float(np.log2(exposure_scale)) if exposure_scale > 0 else 0.0
+        neutral_brightness = _neutral_brightness_report(measured_linear)
 
         self.corrector = corrector
         if wb is not None:
@@ -1013,7 +1060,9 @@ class ColorCorrection(Camera, EasyResource):
 
         self.logger.info(
             f"Calibrated CCM (delta-E mean {report['before']['mean']:.1f} -> "
-            f"{report['after']['mean']:.1f}, exposure {exposure_stops:+.2f} stops)"
+            f"{report['after']['mean']:.1f}, exposure {exposure_stops:+.2f} stops, "
+            f"neutral 6.5 as-shot {neutral_brightness['neutral_6_5']['measured']:.0f}"
+            f"/{neutral_brightness['neutral_6_5']['reference']:.0f})"
             + (f"; white balance [{', '.join(f'{v:.3f}' for v in wb)}]" if wb else "")
             + "; copy `ccm`"
             + (" and `white_balance`" if wb else "")
@@ -1023,6 +1072,7 @@ class ColorCorrection(Camera, EasyResource):
             "ccm": corrector.ccm.tolist(),
             "white_balance": wb,
             "exposure_stops": exposure_stops,
+            "neutral_brightness": neutral_brightness,
             "delta_e": report,
         }
         if wb_note:
@@ -1454,22 +1504,18 @@ class ColorCorrection(Camera, EasyResource):
         failed: List[Dict[str, str]] = []
         for path in paths:
             try:
-                with open(path, "rb") as f:
-                    data = f.read()
-                ext = os.path.splitext(path)[1]  # e.g. ".cr3", ".tif", ".jpg"
+                size = os.path.getsize(path)
                 t_upload = time.perf_counter()
-                await data_client.file_upload(
+                await self._file_upload_chunked(
+                    data_client,
+                    path,
                     part_id=str(part_id),
-                    data=data,
-                    file_name=os.path.basename(path),
-                    file_extension=ext,
-                    tags=tags or None,
-                    component_type="rdk:component:camera",
                     component_name=str(component_name),
+                    tags=tags or None,
                 )
                 self.logger.debug(
                     f"[timing] upload {os.path.basename(path)} "
-                    f"({len(data) / 1e6:.1f} MB): {time.perf_counter() - t_upload:.2f}s"
+                    f"({size / 1e6:.1f} MB): {time.perf_counter() - t_upload:.2f}s"
                 )
                 uploaded.append(path)
             except Exception as exc:  # noqa: BLE001 - report per-file, keep going
@@ -1481,6 +1527,54 @@ class ColorCorrection(Camera, EasyResource):
             + (f" with tags {tags}" if tags else "")
         )
         return {"uploaded": uploaded, "count": len(uploaded), "failed": failed}
+
+    @staticmethod
+    async def _file_upload_chunked(
+        data_client: DataClient,
+        path: str,
+        *,
+        part_id: str,
+        component_name: str,
+        tags: Optional[List[str]],
+    ) -> str:
+        """
+        Stream a file to Viam over the client-streaming FileUpload RPC in
+        UPLOAD_CHUNK_BYTES pieces. ``DataClient.file_upload`` sends the whole
+        file as one gRPC message, which app.viam.com rejects past 32 MiB -
+        silently dropping every CR3 and TIFF from a submit. Chunking also
+        keeps a 250 MB TIFF from being held in memory all at once.
+        """
+        metadata = UploadMetadata(
+            part_id=part_id,
+            component_type="rdk:component:camera",
+            component_name=component_name,
+            type=DataType.DATA_TYPE_FILE,
+            file_name=os.path.basename(path),
+            file_extension=os.path.splitext(path)[1],  # e.g. ".cr3", ".tif"
+            tags=tags,
+        )
+        async with data_client._data_sync_client.FileUpload.open(  # noqa: SLF001
+            metadata=data_client._metadata  # noqa: SLF001
+        ) as stream:
+            await stream.send_message(FileUploadRequest(metadata=metadata))
+            with open(path, "rb") as f:
+                chunk = f.read(UPLOAD_CHUNK_BYTES)
+                while True:
+                    next_chunk = f.read(UPLOAD_CHUNK_BYTES)
+                    # An empty file still needs one (empty) FileData message.
+                    await stream.send_message(
+                        FileUploadRequest(file_contents=FileData(data=chunk)),
+                        end=not next_chunk,
+                    )
+                    if not next_chunk:
+                        break
+                    chunk = next_chunk
+            response: Optional[FileUploadResponse] = await stream.recv_message()
+            if not response:
+                # Raises the appropriate gRPC error for the failed upload.
+                await stream.recv_trailing_metadata()
+                raise TypeError("FileUpload response cannot be empty")
+            return response.binary_data_id
 
     async def get_geometries(
         self, *, extra: Optional[Dict[str, Any]] = None, timeout: Optional[float] = None
