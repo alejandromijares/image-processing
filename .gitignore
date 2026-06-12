@@ -167,4 +167,16 @@ cython_debug/
 .VIAM_RELOAD_ARCHIVE.tar.gz
 reload-*/
 
+# One off scripts
 real_testing.py
+debug_calibration.py
+
+# Images
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.svg
+*.ico
+*.CR3

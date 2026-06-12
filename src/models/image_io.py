@@ -152,6 +152,7 @@ def load_linear_rgb(
     white_balance: Union[str, Sequence[float], None] = "camera",
     exposure_stops: float = 0.0,
     user_flip: Optional[int] = None,
+    half_size: bool = False,
 ) -> np.ndarray:
     """
     Load an image file into a **linear-light** float32 RGB array in [0, 1],
@@ -166,6 +167,10 @@ def load_linear_rgb(
     auto-rotate from EXIF). Pass ``0`` to disable rotation so the output lines
     up pixel-for-pixel with ``raw_image_visible`` / ``render_raw_for_detection``
     - used during color calibration so detected patch centres map across renders.
+
+    ``half_size`` demosaics RAW at half resolution (each 2x2 CFA quad becomes
+    one pixel - roughly 4x faster). Only for preview/throwaway renders; deliver
+    exports from a full-size decode. Ignored for non-RAW inputs.
 
     Non-RAW inputs (JPEG/PNG/TIFF) are assumed to be sRGB-encoded; they're read
     via PIL and linearized. They can't carry more than their stored precision.
@@ -197,9 +202,12 @@ def load_linear_rgb(
             kwargs["exp_shift"] = float(np.clip(2.0 ** exposure_stops, 0.25, 8.0))
         if user_flip is not None:
             kwargs["user_flip"] = int(user_flip)
+        if half_size:
+            kwargs["half_size"] = True
         name = os.path.basename(path)
         size_mb = os.path.getsize(path) / 1e6
-        with log_duration(LOGGER, f"demosaic {name} ({size_mb:.1f} MB) to 16-bit linear"):
+        label = "16-bit linear (half size)" if half_size else "16-bit linear"
+        with log_duration(LOGGER, f"demosaic {name} ({size_mb:.1f} MB) to {label}"):
             with rawpy.imread(path) as raw:
                 rgb16 = raw.postprocess(**kwargs)
         return (np.asarray(rgb16, dtype=np.float32) / 65535.0)
@@ -419,6 +427,14 @@ def linear_to_jpeg_base64(linear_rgb: np.ndarray, max_dim: int = 1024, quality: 
     from io import BytesIO
 
     with log_duration(LOGGER, "encode base64 JPEG preview"):
+        # The gamma encode is per-pixel float math - on a full-res still it
+        # dwarfs everything else here. Stride-sample the linear array down to
+        # ~2x the target first (cheap view, no copy of the full frame), and let
+        # thumbnail()'s proper filter do the final clean resize.
+        h, w = linear_rgb.shape[:2]
+        stride = max(1, max(h, w) // (2 * max_dim))
+        if stride > 1:
+            linear_rgb = linear_rgb[::stride, ::stride]
         rgb8 = _encode_srgb(linear_rgb, 8)
         img = Image.fromarray(rgb8)
         img.thumbnail((max_dim, max_dim))

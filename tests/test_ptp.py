@@ -1,9 +1,12 @@
 """Tests for the PTP model's pure helpers and the USB auto-recovery logic
 (no camera hardware needed)."""
 
+import asyncio
+
 import pytest
 
 from models.ptp import (
+    PTP,
     PTPSession,
     _device_gone,
     _is_image,
@@ -157,3 +160,47 @@ def test_capture_generic_error_keeps_autofocus_hint_and_no_retry():
         session.capture(settle=0.1)
     assert not session.reconnected
     assert cam.triggers == 1
+
+
+# ---------------------------------------------------------------------------
+# `trigger` DoCommand: fires the shutter, returns the on-camera path, and
+# never downloads (the deferred-pipeline handoff)
+# ---------------------------------------------------------------------------
+
+class _TriggerOnlySession:
+    """Fake PTPSession that fails loudly if anything tries to download."""
+
+    def __init__(self):
+        self.captures = 0
+
+    def capture(self, settle):
+        self.captures += 1
+        return "/store/DCIM/100CANON/IMG_0042.CR3"
+
+    def read_file(self, path):
+        raise AssertionError("trigger must not download the file")
+
+
+def _ptp_component(session):
+    ptp = PTP("test-ptp")
+    ptp._session = session
+    ptp._lock = asyncio.Lock()
+    ptp._capture_settle = 0.0
+    ptp._download_dir = None
+    ptp._delete_after_download = False
+    ptp._downloaded = set()
+    return ptp
+
+
+def test_trigger_returns_camera_path_without_download():
+    session = _TriggerOnlySession()
+    ptp = _ptp_component(session)
+
+    resp = asyncio.run(ptp.do_command({"trigger": {}}))
+
+    out = resp["trigger"]
+    assert out["path"] == "/store/DCIM/100CANON/IMG_0042.CR3"
+    assert out["name"] == "IMG_0042.CR3"
+    assert isinstance(out["mime_type"], str)
+    assert "saved_to" not in out  # nothing was downloaded or written
+    assert session.captures == 1

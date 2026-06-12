@@ -30,6 +30,14 @@ Two ways to get images out:
               back the path; in that case we wait `capture_settle` seconds for
               the write to finish and download the newest file on the card.
 
+       {"trigger": {}}
+           -> trip the shutter but skip the download; returns
+              {"name", "path", "mime_type"} where `path` is the file's
+              location *on the camera card*. The fast half of `capture`, for
+              pipelined callers that `download` later (e.g. while a gantry
+              moves to its next pose) - once this returns, the exposure is
+              done and the rig is free to move.
+
        {"list_files": {}}
            -> enumerate the image files on the camera's storage.
               Options: {"new_only": true} to only list files not yet
@@ -609,6 +617,9 @@ class PTP(Camera, EasyResource):
         if "capture" in command:
             resp["capture"] = await self._capture(command.get("capture") or {})
 
+        if "trigger" in command:
+            resp["trigger"] = await self._trigger(command.get("trigger") or {})
+
         if "download" in command:
             resp["download"] = await self._download(command.get("download") or {})
 
@@ -621,7 +632,7 @@ class PTP(Camera, EasyResource):
         if not resp:
             raise ValueError(
                 "no recognized command; supported: summary, list_files, "
-                "capture, download, download_all, delete"
+                "capture, trigger, download, download_all, delete"
             )
         return resp
 
@@ -659,6 +670,26 @@ class PTP(Camera, EasyResource):
             "mime_type": _mime_for(name),
             "saved_to": saved_path,
             "size": len(data),
+        }
+
+    async def _trigger(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
+        """
+        Trip the shutter and return the new file's *on-camera* path without
+        downloading it - the fast half of `capture`, for pipelined callers
+        that fetch the file later via `download` (e.g. while a gantry moves to
+        its next pose). When this returns, the exposure is done and the rig is
+        free to move; the still is safe on the card until downloaded.
+        """
+        start = time.perf_counter()
+        path = await self._run(self._session.capture, self._capture_settle)
+        self.logger.debug(
+            f"[timing] trigger image (trigger + settle): {time.perf_counter() - start:.2f}s"
+        )
+        self.logger.info(f"captured {path} (download deferred)")
+        return {
+            "path": path,
+            "name": os.path.basename(path),
+            "mime_type": _mime_for(os.path.basename(path)),
         }
 
     async def _capture(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:

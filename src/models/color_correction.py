@@ -29,6 +29,20 @@ Two ways to get corrected images out of this component:
    Wire the PTP component as this model's ``camera`` dependency and give PTP a
    ``download_dir`` so its captures land on disk where this model can read them.
 
+       {"capture": {"defer": true}}
+       {"capture_result": {"id": "<capture_id>", "wait_sec": 60}}
+           -> pipelined capture for rigs that move between shots: ``capture``
+              with ``defer`` returns {"capture_id", "status", "camera_path"}
+              as soon as the shutter has fired (exposure done - the rig is
+              free to move), while the USB download, half-size demosaic, CCM,
+              and preview encode continue in the background.
+              ``capture_result`` then returns {"source_path", "image_base64",
+              ...} (or {"status": "pending"} if not done within ``wait_sec``).
+              Deferred captures never write exports or a sidecar - run
+              ``develop`` on the returned ``source_path`` when the files are
+              actually needed. Requires the ptp model (its ``trigger``
+              command) as the source camera.
+
    This is a non-destructive, Capture One-style pipeline: 16-bit linear math,
    no auto-brightness, the original RAW preserved, adjustments recorded in a
    sidecar. See image_io.py for the decode/export details and color-space notes.
@@ -66,6 +80,7 @@ to override detection, or ``compute_wb: false`` to skip white balance.
 config attributes to make the calibration persist across restarts.
 """
 
+import asyncio
 import base64
 import json
 import os
@@ -195,12 +210,14 @@ def _fit_ccm(measured: np.ndarray, reference: np.ndarray) -> np.ndarray:
 
 def _order_corners(pts: np.ndarray) -> np.ndarray:
     """
-    Order 4 chart corners as [top-left, top-right, bottom-right, bottom-left].
+    Order 4 chart corners as [top-left, top-right, bottom-right, bottom-left]
+    *of the image frame* (x+y / x-y heuristic).
 
-    Uses the x+y / x-y heuristic, which is robust for a chart that's roughly
-    upright (rotation < ~45deg) - the studio case where you drop the board in
-    frame. cv2.mcc already corrects perspective; this just fixes the winding so
-    the bilinear grid below lands dark-skin patch first (REFERENCE_SRGB order).
+    This fixes the winding only - it says nothing about which corner sits next
+    to the dark-skin patch. The calibration render is deliberately unrotated
+    (``user_flip=0``), so a portrait shot puts the chart on its side;
+    ``_oriented_chart_grid`` below tries all four 90-degree assignments and
+    keeps the one whose colors match the reference layout.
     """
     pts = np.asarray(pts, dtype=np.float32).reshape(-1, 2)
     s = pts.sum(axis=1)
@@ -211,6 +228,118 @@ def _order_corners(pts: np.ndarray) -> np.ndarray:
         pts[np.argmax(s)],  # bottom-right  (largest  x+y)
         pts[np.argmin(d)],  # bottom-left   (smallest x-y)
     ], dtype=np.float32)
+
+
+def _orientation_score(measured_srgb: np.ndarray) -> float:
+    """
+    How well 24 sampled patch colors match REFERENCE_SRGB's layout: per-channel
+    Pearson correlation, summed over R/G/B (max 3.0). Standardizing each channel
+    makes the score invariant to exposure and to per-channel gain - so an
+    uncorrected white-balance cast can't disguise the right orientation.
+    Wrong rotations land near 0.
+    """
+    score = 0.0
+    for c in range(3):
+        m, r = measured_srgb[:, c], REFERENCE_SRGB[:, c]
+        ms, rs = float(m.std()), float(r.std())
+        if ms < 1e-6 or rs < 1e-6:
+            continue
+        score += float((((m - m.mean()) / ms) * ((r - r.mean()) / rs)).mean())
+    return score
+
+
+# Below this, no candidate rotation matched the reference layout - the detector
+# most likely latched onto something that isn't a ColorChecker Classic.
+_MIN_ORIENTATION_SCORE = 0.75
+
+
+def _oriented_chart_grid(
+    img_rgb: np.ndarray, box: np.ndarray, *, rows: int = 4, cols: int = 6
+) -> Optional[Dict[str, Any]]:
+    """
+    Map a detected chart quad to the 24 patch centres in REFERENCE_SRGB order,
+    robust to the chart sitting at any 90-degree rotation in the frame.
+
+    Tries the four cyclic corner assignments, samples the patch colors each
+    would imply, and keeps the orientation that correlates with the reference
+    layout. Returns ``None`` if none does (false-positive detection).
+
+    Returns a dict with ``centers`` (24, 2), ``neutral_boxes_norm`` (axis-
+    aligned inner boxes over Neutral 8 / 6.5 for raw WB sampling),
+    ``suggested_radius`` (patch-size-relative sampling half-width), and
+    ``orientation_score``.
+    """
+    corners = _order_corners(box)
+    h, w = img_rgb.shape[:2]
+    img_f = img_rgb.astype(np.float32) / 255.0
+
+    def make_grid(c0, c1, c2, c3):
+        # c0->c1 spans the `cols` axis, c0->c3 the `rows` axis.
+        def grid_point(u: float, v: float) -> np.ndarray:
+            top = c0 + (c1 - c0) * u
+            bot = c3 + (c2 - c3) * u
+            return top + (bot - top) * v
+        centers = np.zeros((rows * cols, 2), dtype=np.float32)
+        for r in range(rows):
+            for c in range(cols):
+                centers[r * cols + c] = grid_point((c + 0.5) / cols, (r + 0.5) / rows)
+        return centers, grid_point
+
+    def sample(centers: np.ndarray, radius: int) -> np.ndarray:
+        out = np.zeros((len(centers), 3), dtype=np.float32)
+        for i, (x, y) in enumerate(centers):
+            xi, yi = int(round(float(x))), int(round(float(y)))
+            x0, y0 = max(0, xi - radius), max(0, yi - radius)
+            patch = img_f[y0:yi + radius, x0:xi + radius].reshape(-1, 3)
+            if patch.size:
+                out[i] = np.median(patch, axis=0)
+        return out
+
+    best_score, best = -np.inf, None
+    cycle = list(corners)
+    for _ in range(4):
+        c0, c1, c2, c3 = cycle
+        centers, grid_point = make_grid(c0, c1, c2, c3)
+        patch_px = min(
+            float(np.linalg.norm(c1 - c0)) / cols,
+            float(np.linalg.norm(c3 - c0)) / rows,
+        )
+        radius = max(2, int(0.15 * patch_px))
+        score = _orientation_score(sample(centers, radius))
+        if score > best_score:
+            best_score, best = score, (centers, grid_point, radius)
+        cycle = cycle[1:] + cycle[:1]
+
+    if best is None or best_score < _MIN_ORIENTATION_SCORE:
+        return None
+    centers, grid_point, radius = best
+
+    # Neutral 8 (#19) and Neutral 6.5 (#20): mid-grey patches for raw white
+    # balance - not the white patch (clips) or black (noisy). Inner ~40% of
+    # each, as an axis-aligned box built from the patch's own step vectors so
+    # any chart rotation works.
+    neutral_boxes_norm: List[Tuple[float, float, float, float]] = []
+    for idx in ((rows - 1) * cols + 1, (rows - 1) * cols + 2):
+        r, c = divmod(idx, cols)
+        u, v = (c + 0.5) / cols, (r + 0.5) / rows
+        center = grid_point(u, v)
+        half_u = (grid_point(u + 0.5 / cols, v) - grid_point(u - 0.5 / cols, v)) * 0.2
+        half_v = (grid_point(u, v + 0.5 / rows) - grid_point(u, v - 0.5 / rows)) * 0.2
+        pts = np.array([
+            center + half_u + half_v, center + half_u - half_v,
+            center - half_u + half_v, center - half_u - half_v,
+        ])
+        neutral_boxes_norm.append((
+            float(pts[:, 0].min()) / w, float(pts[:, 1].min()) / h,
+            float(pts[:, 0].max()) / w, float(pts[:, 1].max()) / h,
+        ))
+
+    return {
+        "centers": centers,
+        "neutral_boxes_norm": neutral_boxes_norm,
+        "suggested_radius": radius,
+        "orientation_score": best_score,
+    }
 
 
 def detect_colorchecker(
@@ -225,10 +354,16 @@ def detect_colorchecker(
       ``neutral_boxes_norm`` (x0, y0, x1, y1) boxes (fractions of W/H) over the
                              Neutral 8 and Neutral 6.5 patches, for raw white
                              balance sampling.
+      ``suggested_radius``   patch-size-relative sampling half-width (px).
+      ``orientation_score``  reference-layout correlation of the chosen
+                             rotation (max 3.0).
 
-    Patch centres come from bilinearly interpolating the detected chart box over
-    a rows x cols grid - geometry only, so the same centres are valid on any
-    co-registered render (the linear CCM render, the raw CFA).
+    Patch centres come from bilinearly interpolating the detected chart box
+    over a rows x cols grid, after resolving which of the four 90-degree
+    rotations the chart sits at (see ``_oriented_chart_grid``) - so a portrait
+    shot, whose calibration render is deliberately unrotated, still maps
+    correctly. The centres are geometry, valid on any co-registered render
+    (the linear CCM render, the raw CFA).
     """
     if cv2 is None:
         raise RuntimeError(
@@ -253,32 +388,7 @@ def detect_colorchecker(
     box = np.asarray(checkers[0].getBox(), dtype=np.float32).reshape(-1, 2)
     if box.shape[0] != 4:
         return None
-    tl, tr, br, bl = _order_corners(box)
-
-    def grid_point(u: float, v: float) -> np.ndarray:
-        top = tl + (tr - tl) * u
-        bot = bl + (br - bl) * u
-        return top + (bot - top) * v
-
-    centers = np.zeros((rows * cols, 2), dtype=np.float32)
-    for r in range(rows):
-        for c in range(cols):
-            centers[r * cols + c] = grid_point((c + 0.5) / cols, (r + 0.5) / rows)
-
-    # Neutral 8 (#20) and Neutral 6.5 (#21): bottom row, 2nd and 3rd cells. Avoid
-    # the white patch (clips) and black (noisy). Sample the inner ~40% of each.
-    h, w = img_rgb.shape[:2]
-    half_w = 0.2 * float(np.linalg.norm(tr - tl)) / cols
-    half_h = 0.2 * float(np.linalg.norm(bl - tl)) / rows
-    neutral_boxes_norm: List[Tuple[float, float, float, float]] = []
-    for idx in ((rows - 1) * cols + 1, (rows - 1) * cols + 2):
-        cx, cy = centers[idx]
-        neutral_boxes_norm.append((
-            (cx - half_w) / w, (cy - half_h) / h,
-            (cx + half_w) / w, (cy + half_h) / h,
-        ))
-
-    return {"centers": centers, "neutral_boxes_norm": neutral_boxes_norm}
+    return _oriented_chart_grid(img_rgb, box, rows=rows, cols=cols)
 
 
 class PatchSampler:
@@ -579,6 +689,14 @@ class ColorCorrection(Camera, EasyResource):
         )
         self._data_client: Optional[DataClient] = None
 
+        # In-flight deferred captures (`capture` with `defer: true`), keyed by
+        # the capture_id handed back to the caller. Preserved across
+        # reconfigure so a mid-sequence config change doesn't orphan results.
+        self._pending_captures: Dict[str, "asyncio.Task"] = getattr(
+            self, "_pending_captures", {}
+        )
+        self._capture_seq: int = getattr(self, "_capture_seq", 0)
+
         if self._output_dir:
             os.makedirs(self._output_dir, exist_ok=True)
 
@@ -655,6 +773,11 @@ class ColorCorrection(Camera, EasyResource):
                 command.get("capture") or {}, timeout
             )
 
+        if "capture_result" in command:
+            resp["capture_result"] = await self._capture_result(
+                command.get("capture_result") or {}
+            )
+
         if "develop" in command:
             resp["develop"] = await self._develop(command.get("develop") or {})
 
@@ -664,7 +787,7 @@ class ColorCorrection(Camera, EasyResource):
         if not resp:
             raise ValueError(
                 "no recognized command; supported: calibrate_color, capture, "
-                "develop, upload"
+                "capture_result, develop, upload"
             )
         return resp
 
@@ -677,6 +800,7 @@ class ColorCorrection(Camera, EasyResource):
         capture: Any,
         white_balance: Any,
         exposure_stops: float,
+        half_size: bool = False,
     ) -> Tuple[np.ndarray, Optional[str]]:
         """
         Turn a source camera's ``capture`` DoCommand response into a
@@ -704,7 +828,8 @@ class ColorCorrection(Camera, EasyResource):
         path = capture.get("saved_to") or capture.get("path")
         if path:
             linear = load_linear_rgb(
-                str(path), white_balance=white_balance, exposure_stops=exposure_stops
+                str(path), white_balance=white_balance,
+                exposure_stops=exposure_stops, half_size=half_size,
             )
             return linear, str(path)
 
@@ -780,7 +905,8 @@ class ColorCorrection(Camera, EasyResource):
           ``capture_options``forwarded to the source ``capture`` (e.g. {"af": true}).
           ``compute_wb``     derive white balance from the chart (default true).
           ``patch_centers``  24 [x, y] coords to override auto-detection.
-          ``radius``         patch sampling half-width (default 10).
+          ``radius``         patch sampling half-width in px (default: ~15% of
+                             the detected patch size, or 10 with manual centers).
 
         Returns ``ccm`` (pure-colour, ~unity-gain), ``white_balance``
         ([r,g,b,g2] or null), ``exposure_stops`` (the brightness offset the chart
@@ -791,7 +917,7 @@ class ColorCorrection(Camera, EasyResource):
         """
         raw_path, rgb8 = await self._acquire_calibration_source(opts, timeout)
         compute_wb = bool(opts.get("compute_wb", True))
-        radius = int(opts.get("radius", 10))
+        radius = int(opts["radius"]) if "radius" in opts else None
         manual_centers = opts.get("patch_centers")
 
         # Image used to *locate* the patches. For a RAW we render it unrotated
@@ -804,6 +930,7 @@ class ColorCorrection(Camera, EasyResource):
                 [(int(x), int(y)) for x, y in manual_centers], dtype=np.float32
             )
             neutral_boxes = None
+            radius = radius if radius is not None else 10
         else:
             detection = detect_colorchecker(detect_img)
             if detection is None:
@@ -811,6 +938,8 @@ class ColorCorrection(Camera, EasyResource):
                     "could not auto-detect the ColorChecker; ensure the whole "
                     "chart is visible and unobstructed, or pass `patch_centers`"
                 )
+            if radius is None:
+                radius = int(detection["suggested_radius"])
             centers = detection["centers"]
             neutral_boxes = detection["neutral_boxes_norm"]
 
@@ -912,17 +1041,34 @@ class ColorCorrection(Camera, EasyResource):
           ``capture_options``  forwarded to the source's ``capture`` (e.g. {"af": true})
           ``white_balance``    "camera" (default) | "auto" | "daylight" | [r,g,b,g2]
           ``exposure_stops``   exposure compensation applied at the raw stage
-          ``output_formats``   subset of tiff16/tiff8/jpeg/png16/png8
+          ``output_formats``   subset of tiff16/tiff8/jpeg/png16/png8; pass []
+                               to skip exports (preview-only capture - develop
+                               the RAW later with the ``develop`` command)
           ``output_dir``       where to write exports (default: next to the source file)
+          ``defer``            true -> return as soon as the shutter has fired
+                               (the rig is free to move); download/decode/preview
+                               continue in the background and are fetched with
+                               ``capture_result``. Requires a source camera with
+                               a ``trigger`` DoCommand (the ptp model). Deferred
+                               captures never write exports or a sidecar - run
+                               ``develop`` on the RAW for those.
 
         Returns the written export paths, the sidecar path, and a small base64
-        JPEG preview (not the full-res image - that stays on disk).
+        JPEG preview (not the full-res image - that stays on disk). With
+        ``defer`` it instead returns {"capture_id", "status": "pending",
+        "camera_path"} immediately after the shutter fires.
         """
+        if opts.get("defer"):
+            return await self._capture_deferred(opts, timeout)
+
         capture_opts = opts.get("capture_options", {"af": True})
         white_balance = opts.get("white_balance", self._white_balance)
         exposure_stops = float(opts.get("exposure_stops", 0.0))
         formats = list(opts.get("output_formats", self._output_formats))
         out_dir_override = opts.get("output_dir") or self._output_dir
+        # When nothing is being exported, the decode only feeds the preview -
+        # a half-resolution demosaic is ~4x faster and indistinguishable there.
+        preview_only = not formats
 
         start = time.perf_counter()
         source_resp = await self.camera.do_command({"capture": capture_opts}, timeout=timeout)
@@ -933,19 +1079,152 @@ class ColorCorrection(Camera, EasyResource):
         )
 
         t_decode = time.perf_counter()
-        linear, source_path = self._linear_from_capture_response(
-            capture, white_balance, exposure_stops
+        # The decode and develop/export steps are seconds of pure CPU; run them
+        # in a worker thread so the event loop keeps serving other requests.
+        linear, source_path = await asyncio.to_thread(
+            self._linear_from_capture_response,
+            capture, white_balance, exposure_stops, preview_only,
         )
         self.logger.debug(
             f"[timing] decode to linear RGB (incl. white balance): "
             f"{time.perf_counter() - t_decode:.2f}s"
         )
-        result = self._develop_one(
-            linear, source_path, white_balance, exposure_stops, formats, out_dir_override
+        result = await asyncio.to_thread(
+            self._develop_one,
+            linear, source_path, white_balance, exposure_stops, formats,
+            out_dir_override,
         )
         self.logger.debug(
             f"[timing] capture pipeline total: {time.perf_counter() - start:.2f}s"
         )
+        return result
+
+    async def _capture_deferred(
+        self, opts: Mapping[str, Any], timeout: Optional[float]
+    ) -> Mapping[str, ValueTypes]:
+        """
+        Fire the shutter and return as soon as the exposure is done, so the
+        caller can move the rig while the slow parts (USB download, demosaic,
+        preview encode) run in a background task. The source's lock serializes
+        camera access, so a background download naturally queues ahead of the
+        next pose's trigger.
+        """
+        white_balance = opts.get("white_balance", self._white_balance)
+        exposure_stops = float(opts.get("exposure_stops", 0.0))
+
+        start = time.perf_counter()
+        try:
+            resp = await self.camera.do_command(
+                {"trigger": opts.get("capture_options", {})}, timeout=timeout
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"deferred capture needs a source camera with a `trigger` "
+                f"DoCommand (the ptp model); triggering failed: {exc}"
+            ) from exc
+        trig = resp.get("trigger") or {}
+        camera_path = trig.get("path")
+        if not camera_path:
+            raise ValueError("source camera `trigger` returned no `path`")
+        self.logger.debug(
+            f"[timing] deferred capture trigger (shutter + settle): "
+            f"{time.perf_counter() - start:.2f}s"
+        )
+
+        self._capture_seq += 1
+        stem = os.path.splitext(os.path.basename(str(camera_path)))[0]
+        capture_id = f"{self._capture_seq}-{stem}"
+        self._pending_captures[capture_id] = asyncio.create_task(
+            self._finish_deferred_capture(
+                capture_id, str(camera_path), white_balance, exposure_stops
+            )
+        )
+        # Drop completed-and-collected stragglers if a caller never fetched
+        # them, so an unattended sequence can't grow the table without bound.
+        if len(self._pending_captures) > 64:
+            for key in [
+                k for k, t in self._pending_captures.items() if t.done()
+            ][:-64]:
+                self._pending_captures.pop(key, None)
+
+        return {
+            "capture_id": capture_id,
+            "status": "pending",
+            "camera_path": str(camera_path),
+        }
+
+    async def _finish_deferred_capture(
+        self,
+        capture_id: str,
+        camera_path: str,
+        white_balance: Any,
+        exposure_stops: float,
+    ) -> Dict[str, ValueTypes]:
+        """Background half of a deferred capture: download the still from the
+        camera, decode at half size, apply the CCM, and build the preview. No
+        exports or sidecar - the RAW on disk is the handoff to ``develop``."""
+        start = time.perf_counter()
+        resp = await self.camera.do_command({"download": {"path": camera_path}})
+        meta = resp.get("download") or {}
+        saved = meta.get("saved_to")
+        if not saved:
+            raise ValueError(
+                f"source camera did not save {camera_path!r} to disk; configure "
+                f"its `download_dir` so deferred captures can be developed later"
+            )
+        linear = await asyncio.to_thread(
+            load_linear_rgb, str(saved),
+            white_balance=white_balance, exposure_stops=exposure_stops,
+            half_size=True,
+        )
+        corrected = await asyncio.to_thread(self.corrector.apply_to_linear, linear)
+        preview = await asyncio.to_thread(linear_to_jpeg_base64, corrected)
+        self.logger.debug(
+            f"[timing] deferred capture {capture_id} background "
+            f"(download + decode + preview): {time.perf_counter() - start:.2f}s"
+        )
+        return {
+            "capture_id": capture_id,
+            "status": "done",
+            "source_path": str(saved),
+            "image_base64": preview,
+            "mime_type": CameraMimeType.JPEG.value,
+            "ccm_applied": not self.corrector.is_identity,
+            "color_space": "sRGB",
+        }
+
+    async def _capture_result(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
+        """
+        Fetch the result of a deferred capture.
+
+        ``opts``:
+          ``id``        the capture_id returned by ``capture`` with ``defer`` (required)
+          ``wait_sec``  how long to wait for the background work (default 60;
+                        0 polls). Returns {"status": "pending"} on timeout -
+                        call again to keep waiting.
+        """
+        capture_id = opts.get("id") or opts.get("capture_id")
+        if not capture_id:
+            raise ValueError(
+                "`capture_result` needs the `id` returned by `capture` with `defer`"
+            )
+        capture_id = str(capture_id)
+        task = self._pending_captures.get(capture_id)
+        if task is None:
+            raise ValueError(
+                f"unknown capture id {capture_id!r}; it may have already been "
+                f"collected, or the module restarted since the capture"
+            )
+        wait_sec = float(opts.get("wait_sec", 60.0))
+        try:
+            # shield() so a timeout here doesn't cancel the background work.
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=wait_sec)
+        except asyncio.TimeoutError:
+            return {"capture_id": capture_id, "status": "pending"}
+        except Exception as exc:
+            self._pending_captures.pop(capture_id, None)
+            raise RuntimeError(f"deferred capture {capture_id} failed: {exc}") from exc
+        self._pending_captures.pop(capture_id, None)
         return result
 
     async def _develop(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
@@ -982,11 +1261,15 @@ class ColorCorrection(Camera, EasyResource):
         results: List[Mapping[str, ValueTypes]] = []
         for path in paths:
             t_file = time.perf_counter()
-            linear = load_linear_rgb(
-                path, white_balance=white_balance, exposure_stops=exposure_stops
+            # Decode + export are seconds of pure CPU per file; keep them off
+            # the event loop so other requests stay responsive mid-batch.
+            linear = await asyncio.to_thread(
+                load_linear_rgb,
+                path, white_balance=white_balance, exposure_stops=exposure_stops,
             )
             results.append(
-                self._develop_one(
+                await asyncio.to_thread(
+                    self._develop_one,
                     linear, path, white_balance, exposure_stops, formats,
                     out_dir_override,
                     # Skip the per-file base64 preview in batch mode to keep the

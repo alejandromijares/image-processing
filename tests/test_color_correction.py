@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from models.color_correction import (
+    _oriented_chart_grid,
     REFERENCE_SRGB,
     ColorCorrector,
     PatchSampler,
@@ -162,3 +163,188 @@ def test_calibrate_from_rgb_corrects_a_cast():
     ref8 = (REFERENCE_SRGB * 255.0).round()
     sampled = np.array([corrected[y, x] for x, y in centers], dtype=np.float32)
     assert np.abs(sampled - ref8).mean() < 3.0
+
+
+# ---------------------------------------------------------------------------
+# Orientation-robust chart grid (_oriented_chart_grid)
+# ---------------------------------------------------------------------------
+
+def _grid_corners(img: np.ndarray) -> np.ndarray:
+    h, w = img.shape[:2]
+    return np.array([(0, 0), (w, 0), (w, h), (0, h)], dtype=np.float32)
+
+
+@pytest.mark.parametrize("k", [0, 1, 2, 3])
+def test_oriented_grid_resolves_any_90_degree_rotation(k):
+    """A chart rotated k*90deg in frame must still map patches in reference order."""
+    img = np.ascontiguousarray(np.rot90(_synthetic_chart(), k))
+    detection = _oriented_chart_grid(img, _grid_corners(img))
+    assert detection is not None
+    assert detection["orientation_score"] > 2.0
+
+    centers = [(int(x), int(y)) for x, y in detection["centers"]]
+    measured = PatchSampler.sample_at_centers(img, centers)
+    assert np.allclose(measured, srgb_to_linear(REFERENCE_SRGB), atol=0.005)
+
+
+@pytest.mark.parametrize("k", [0, 1, 2, 3])
+def test_oriented_grid_neutral_boxes_land_on_grays(k):
+    """The WB boxes must cover Neutral 8 / 6.5 regardless of chart rotation."""
+    img = np.ascontiguousarray(np.rot90(_synthetic_chart(), k))
+    h, w = img.shape[:2]
+    detection = _oriented_chart_grid(img, _grid_corners(img))
+    assert detection is not None
+    for box, expected in zip(detection["neutral_boxes_norm"], ([200] * 3, [160] * 3)):
+        x0, y0, x1, y1 = box
+        region = img[int(y0 * h):int(y1 * h), int(x0 * w):int(x1 * w)]
+        assert region.size > 0
+        assert np.allclose(np.median(region.reshape(-1, 3), axis=0), expected, atol=2)
+
+
+def test_oriented_grid_survives_white_balance_cast():
+    """A strong channel cast (the wrong-WB case) must not confuse orientation."""
+    img = _synthetic_chart()
+    cast_linear = srgb_to_linear(img.astype(np.float32) / 255.0) * [0.4, 1.0, 2.2]
+    cast = (linear_to_srgb(np.clip(cast_linear, 0, 1)) * 255).round().astype(np.uint8)
+    cast = np.ascontiguousarray(np.rot90(cast, 1))
+
+    detection = _oriented_chart_grid(cast, _grid_corners(cast))
+    assert detection is not None
+
+    upright = _synthetic_chart()
+    upright_detection = _oriented_chart_grid(upright, _grid_corners(upright))
+    # Same patch (white) must land at the rotated position of the upright one.
+    ux, uy = upright_detection["centers"][18]
+    rx, ry = detection["centers"][18]
+    # rot90(k=1) maps (x, y) -> (y, W-1-x) where W is the original width
+    assert abs(rx - uy) < 1.5 and abs(ry - (upright.shape[1] - 1 - ux)) < 1.5
+
+
+def test_oriented_grid_rejects_non_chart():
+    """A quad over random noise has no orientation that matches the reference."""
+    rng = np.random.default_rng(7)
+    noise = rng.integers(0, 255, size=(240, 360, 3), dtype=np.uint8)
+    assert _oriented_chart_grid(noise, _grid_corners(noise)) is None
+
+
+# ---------------------------------------------------------------------------
+# Deferred capture (`capture` with `defer` + `capture_result`): the pipelined
+# flow for rigs that move between shots. Exercised against a fake source
+# camera - no viam-server, no hardware.
+# ---------------------------------------------------------------------------
+
+import asyncio
+
+from PIL import Image
+
+from models.color_correction import ColorCorrection
+
+
+class _FakeSource:
+    """Fake PTP-style source camera: `trigger` hands back an on-camera path,
+    `download` "saves" a file that already exists at `saved_path`."""
+
+    def __init__(self, saved_path, supports_trigger=True, saves_to_disk=True):
+        self.saved_path = saved_path
+        self.supports_trigger = supports_trigger
+        self.saves_to_disk = saves_to_disk
+        self.commands = []
+
+    async def do_command(self, command, *, timeout=None, **kwargs):
+        self.commands.append(command)
+        if "trigger" in command:
+            if not self.supports_trigger:
+                raise ValueError("no recognized command")
+            return {"trigger": {"path": "/store/DCIM/IMG_0042.PNG",
+                                "name": "IMG_0042.PNG"}}
+        if "download" in command:
+            return {"download": {
+                "path": command["download"]["path"],
+                "name": "IMG_0042.PNG",
+                "saved_to": self.saved_path if self.saves_to_disk else None,
+            }}
+        if "capture" in command:
+            return {"capture": {"saved_to": self.saved_path}}
+        raise ValueError("no recognized command")
+
+
+def _component(source, output_dir=None):
+    cc = ColorCorrection("test-cc")
+    cc.camera = source
+    cc.corrector = ColorCorrector.identity()
+    cc._white_balance = "camera"
+    cc._output_formats = ["tiff16", "jpeg"]
+    cc._output_dir = output_dir
+    cc._jpeg_quality = 95
+    cc._write_sidecar = False
+    cc._part_id = None
+    cc._data_client = None
+    cc._pending_captures = {}
+    cc._capture_seq = 0
+    return cc
+
+
+def _write_still(tmp_path):
+    p = str(tmp_path / "IMG_0042.PNG")
+    Image.fromarray(np.full((8, 8, 3), 120, np.uint8)).save(p, format="PNG")
+    return p
+
+
+def test_deferred_capture_round_trip(tmp_path):
+    source = _FakeSource(_write_still(tmp_path))
+    cc = _component(source, output_dir=str(tmp_path / "out"))
+
+    async def run():
+        ticket = (await cc.do_command({"capture": {"defer": True}}))["capture"]
+        assert ticket["status"] == "pending"
+        assert ticket["camera_path"] == "/store/DCIM/IMG_0042.PNG"
+        result = (await cc.do_command(
+            {"capture_result": {"id": ticket["capture_id"], "wait_sec": 30}}
+        ))["capture_result"]
+        return ticket, result
+
+    ticket, result = asyncio.run(run())
+    assert result["status"] == "done"
+    assert result["source_path"] == source.saved_path
+    assert result["image_base64"]  # preview present
+    # Deferred captures hand off the RAW only - no exports, no sidecar.
+    assert "exports" not in result
+    # The ticket is collected exactly once.
+    with pytest.raises(ValueError, match="unknown capture id"):
+        asyncio.run(cc._capture_result({"id": ticket["capture_id"]}))
+
+
+def test_deferred_capture_requires_trigger_support():
+    source = _FakeSource(saved_path=None, supports_trigger=False)
+    cc = _component(source)
+    with pytest.raises(RuntimeError, match="`trigger`"):
+        asyncio.run(cc.do_command({"capture": {"defer": True}}))
+
+
+def test_deferred_capture_surfaces_background_failure(tmp_path):
+    """A source without a download_dir fails in the background task; the
+    error must surface on collect, not vanish."""
+    source = _FakeSource(saved_path=None, saves_to_disk=False)
+    cc = _component(source, output_dir=str(tmp_path / "out"))
+
+    async def run():
+        ticket = (await cc.do_command({"capture": {"defer": True}}))["capture"]
+        with pytest.raises(RuntimeError, match="download_dir"):
+            await cc.do_command(
+                {"capture_result": {"id": ticket["capture_id"], "wait_sec": 30}}
+            )
+
+    asyncio.run(run())
+
+
+def test_preview_only_capture_skips_exports(tmp_path):
+    """`output_formats: []` is the preview-only fast path: no files written,
+    preview still returned, RAW path handed back for a later `develop`."""
+    source = _FakeSource(_write_still(tmp_path))
+    cc = _component(source, output_dir=str(tmp_path / "out"))
+
+    resp = asyncio.run(cc.do_command({"capture": {"output_formats": []}}))
+    out = resp["capture"]
+    assert out["exports"] == {}
+    assert out["image_base64"]
+    assert out["source_path"] == source.saved_path

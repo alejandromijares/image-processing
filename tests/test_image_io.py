@@ -170,3 +170,69 @@ def test_linear_to_jpeg_base64_downsizes():
     assert max(img.size) <= 256
     # Aspect ratio preserved (2:1).
     assert img.size[1] == 256 and img.size[0] == 128
+
+
+def test_linear_to_jpeg_base64_stride_keeps_values():
+    """The pre-gamma stride downsample is a pure speed move - a solid frame
+    must come out at the same encoded value (and size) as the slow path."""
+    value = srgb_to_linear(np.float32(150 / 255.0))
+    linear = np.full((1200, 900, 3), value, dtype=np.float32)
+    b64 = linear_to_jpeg_base64(linear, max_dim=128)
+    img = Image.open(BytesIO(base64.b64decode(b64)))
+    assert img.size == (96, 128)  # 4:3 preserved through stride + thumbnail
+    arr = np.array(img.convert("RGB"))
+    assert np.allclose(arr, 150, atol=2)  # JPEG-lossy tolerance
+
+
+def test_linear_to_jpeg_base64_no_stride_on_small_input():
+    """Inputs already near the target size must not be stride-sampled away."""
+    linear = np.full((300, 200, 3), 0.5, dtype=np.float32)
+    b64 = linear_to_jpeg_base64(linear, max_dim=256)
+    img = Image.open(BytesIO(base64.b64decode(b64)))
+    # stride must stay 1 here; only thumbnail() shrinks (300 -> 256 exactly).
+    assert img.size[1] == 256 and 170 <= img.size[0] <= 171
+
+
+# ---------------------------------------------------------------------------
+# RAW decode options (rawpy faked - no real CR3 in unit tests)
+# ---------------------------------------------------------------------------
+
+class _FakeRawpy:
+    """Stands in for the rawpy module: records postprocess kwargs."""
+
+    class ColorSpace:
+        sRGB = "srgb"
+
+    def __init__(self):
+        self.postprocess_kwargs = None
+
+    def imread(self, path):
+        fake = self
+
+        class _Raw:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def postprocess(self, **kwargs):
+                fake.postprocess_kwargs = kwargs
+                return np.zeros((4, 4, 3), dtype=np.uint16)
+
+        return _Raw()
+
+
+def test_load_linear_rgb_half_size_passthrough(tmp_path, monkeypatch):
+    import models.image_io as image_io
+
+    fake = _FakeRawpy()
+    monkeypatch.setattr(image_io, "rawpy", fake)
+    raw_path = tmp_path / "IMG_0042.CR3"
+    raw_path.write_bytes(b"not really a raw")
+
+    load_linear_rgb(str(raw_path), half_size=True)
+    assert fake.postprocess_kwargs["half_size"] is True
+
+    load_linear_rgb(str(raw_path))
+    assert "half_size" not in fake.postprocess_kwargs
