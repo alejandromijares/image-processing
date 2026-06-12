@@ -166,3 +166,5 @@ cython_debug/
 # Viam reload files
 .VIAM_RELOAD_ARCHIVE.tar.gz
 reload-*/
+
+real_testing.py
