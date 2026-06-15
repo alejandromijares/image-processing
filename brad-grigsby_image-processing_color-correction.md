@@ -62,6 +62,7 @@ installs those automatically on Debian/Ubuntu.
 | `output_formats` | string[]     | Optional  | Any of `tiff16`/`tiff8`/`jpeg`/`png16`/`png8`. Default: all four.                       |
 | `jpeg_quality`   | int          | Optional  | JPEG export quality. Default `95`.                                                      |
 | `white_balance`  | string/array | Optional  | RAW white balance: `camera` (default), `auto`, `daylight`, or `[r,g,b,g2]` multipliers. |
+| `exposure_stops` | number       | Optional  | Default exposure compensation (stops) applied at the raw stage. Paste the value `calibrate_color` reports to render captures at the calibrated reference brightness. Default `0`. A per-call `exposure_stops` overrides it. |
 | `write_sidecar`  | boolean      | Optional  | Write a `<name>.json` sidecar recording the development. Default `true`.                |
 | `part_id`        | string       | Optional  | Machine part to attach `upload`s to. Defaults to `VIAM_MACHINE_PART_ID` from the env.   |
 | `delete_after_upload` | boolean | Optional  | Remove each local file once its `upload` succeeds (failed uploads keep their files for retry). Default `false`. |
@@ -103,8 +104,13 @@ for calibration), `patch_centers` (24 `[x, y]` pixel coords in ColorChecker
 order — use this when the chart does not fill the frame), `radius` (int, patch
 sampling radius).
 
-Returns the fitted `ccm` (copy this into config) and a `delta_e` quality report
-(mean/max color error before vs. after).
+Returns the fitted `ccm`, the measured `white_balance`, and `exposure_stops` —
+copy all three into the matching config attributes to persist the calibration.
+`exposure_stops` is the brightness offset the chart implied vs. the reference;
+setting it renders captures at the calibrated brightness without re-shooting (use
+it when the flash can't reach the reference optically). Also returns a `delta_e`
+quality report (mean/max color error before vs. after) and a `neutral_brightness`
+readout (measured vs. reference per grey patch).
 
 ### Capture a corrected still
 

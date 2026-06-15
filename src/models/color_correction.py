@@ -49,8 +49,9 @@ Two ways to get corrected images out of this component:
 
    Relevant config attributes: ``output_dir`` (default: next to the source),
    ``output_formats`` (default ["tiff16", "jpeg", "png16", "png8"]),
-   ``jpeg_quality`` (95), ``white_balance`` ("camera"), ``write_sidecar`` (true),
-   ``delete_after_upload`` (false).
+   ``jpeg_quality`` (95), ``white_balance`` ("camera"), ``exposure_stops`` (0.0 -
+   paste the value `calibrate_color` reports to render at the calibrated
+   brightness), ``write_sidecar`` (true), ``delete_after_upload`` (false).
 
        {"develop": {"path": "/photos/IMG_0042.CR3"}}
        {"develop": {"paths": ["/photos/a.CR3", "/photos/b.CR3"]}}
@@ -698,6 +699,10 @@ class ColorCorrection(Camera, EasyResource):
         if output_dir is not None and not isinstance(output_dir, str):
             raise ValueError("`output_dir` must be a string path")
 
+        exposure_stops = attrs.get("exposure_stops")
+        if exposure_stops is not None and not isinstance(exposure_stops, (int, float)):
+            raise ValueError("`exposure_stops` must be a number (stops of exposure)")
+
         return [str(camera)], []
 
     def reconfigure(
@@ -730,6 +735,13 @@ class ColorCorrection(Camera, EasyResource):
         )
         self._jpeg_quality: int = int(attrs.get("jpeg_quality", 95))
         self._white_balance = attrs.get("white_balance", "camera")
+        # Default exposure compensation (stops) applied at the raw stage, the
+        # digital counterpart to flash power. `calibrate_color` reports the
+        # offset the chart implied vs. the reference; paste it here (alongside
+        # `ccm` / `white_balance`) to render every capture at the calibrated
+        # brightness when the flash can't reach the reference optically. Per-call
+        # `exposure_stops` on capture/develop still overrides this.
+        self._exposure_stops: float = float(attrs.get("exposure_stops", 0.0))
         self._write_sidecar: bool = bool(attrs.get("write_sidecar", True))
 
         # Local-disk hygiene, mirroring ptp's `delete_after_download`: once a
@@ -1130,7 +1142,7 @@ class ColorCorrection(Camera, EasyResource):
 
         capture_opts = opts.get("capture_options", {"af": True})
         white_balance = opts.get("white_balance", self._white_balance)
-        exposure_stops = float(opts.get("exposure_stops", 0.0))
+        exposure_stops = float(opts.get("exposure_stops", self._exposure_stops))
         formats = list(opts.get("output_formats", self._output_formats))
         out_dir_override = opts.get("output_dir") or self._output_dir
         # When nothing is being exported, the decode only feeds the preview -
@@ -1177,7 +1189,7 @@ class ColorCorrection(Camera, EasyResource):
         next pose's trigger.
         """
         white_balance = opts.get("white_balance", self._white_balance)
-        exposure_stops = float(opts.get("exposure_stops", 0.0))
+        exposure_stops = float(opts.get("exposure_stops", self._exposure_stops))
 
         start = time.perf_counter()
         try:
@@ -1321,7 +1333,7 @@ class ColorCorrection(Camera, EasyResource):
         paths = [str(p) for p in raw_paths]
 
         white_balance = opts.get("white_balance", self._white_balance)
-        exposure_stops = float(opts.get("exposure_stops", 0.0))
+        exposure_stops = float(opts.get("exposure_stops", self._exposure_stops))
         formats = list(opts.get("output_formats", self._output_formats))
         out_dir_override = opts.get("output_dir") or self._output_dir
 

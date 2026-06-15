@@ -297,6 +297,7 @@ def _component(source, output_dir=None):
     cc.camera = source
     cc.corrector = ColorCorrector.identity()
     cc._white_balance = "camera"
+    cc._exposure_stops = 0.0
     cc._output_formats = ["tiff16", "jpeg"]
     cc._output_dir = output_dir
     cc._jpeg_quality = 95
@@ -373,6 +374,32 @@ def test_preview_only_capture_skips_exports(tmp_path):
     assert out["exports"] == {}
     assert out["image_base64"]
     assert out["source_path"] == source.saved_path
+
+
+def test_configured_exposure_stops_flows_into_develop(tmp_path, monkeypatch):
+    """The `exposure_stops` config default reaches the raw decode when a call
+    doesn't override it (the digital counterpart to flash power), and a per-call
+    value still wins."""
+    import models.color_correction as cc_mod
+
+    cc = _component(_FakeSource(saved_path=None), output_dir=str(tmp_path / "out"))
+    cc._exposure_stops = 0.87
+
+    seen = {}
+    real = cc_mod.load_linear_rgb
+
+    def spy(path, **kwargs):
+        seen["exposure_stops"] = kwargs.get("exposure_stops")
+        return real(path, **kwargs)
+
+    monkeypatch.setattr(cc_mod, "load_linear_rgb", spy)
+    p = _write_still(tmp_path)
+
+    asyncio.run(cc.do_command({"develop": {"path": p}}))
+    assert seen["exposure_stops"] == 0.87  # config default applied
+
+    asyncio.run(cc.do_command({"develop": {"path": p, "exposure_stops": 0.0}}))
+    assert seen["exposure_stops"] == 0.0  # per-call override wins
 
 
 # ---------------------------------------------------------------------------
