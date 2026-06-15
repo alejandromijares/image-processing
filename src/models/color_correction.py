@@ -53,7 +53,10 @@ Two ways to get corrected images out of this component:
    paste the value `calibrate_color` reports to render at the calibrated
    brightness), ``tone`` ("none" - delivery look: "none" is colour-accurate /
    colorimetric, "medium"/"bright" lift the midtones for a Capture One-style
-   punch), ``write_sidecar`` (true), ``delete_after_upload`` (false).
+   punch), ``sharpen`` ("none" - capture sharpening: "light"/"medium"/"strong",
+   since RAW is soft before sharpening), ``demosaic`` ("DHT" - RAW demosaic
+   algorithm, sharper than libraw's stock AHD), ``write_sidecar`` (true),
+   ``delete_after_upload`` (false).
 
        {"develop": {"path": "/photos/IMG_0042.CR3"}}
        {"develop": {"paths": ["/photos/a.CR3", "/photos/b.CR3"]}}
@@ -134,7 +137,10 @@ from viam.resource.types import Model, ModelFamily
 from viam.utils import ValueTypes, struct_to_dict
 
 from models.image_io import (
+    DEFAULT_DEMOSAIC,
+    DEMOSAIC_ALGORITHMS,
     EXPORT_FORMATS,
+    SHARPEN_OPTIONS,
     TONE_OPTIONS,
     compute_raw_wb_multipliers,
     export_renditions,
@@ -168,41 +174,73 @@ DEFAULT_OUTPUT_FORMATS = ["tiff16", "jpeg", "png16", "png8"]
 UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 # ---------------------------------------------------------------------------
-# ColorChecker Classic reference values (24 patches, sRGB, D50 illuminant)
-# Row order: dark skin -> white, left-to-right, top-to-bottom as the chart
-# is oriented with the "colorchecker CLASSIC" text at the top.
-# Source: Calibrite / X-Rite published sRGB reference (gamma-encoded, 0-255)
+# ColorChecker Classic reference values (24 patches)
 # ---------------------------------------------------------------------------
-REFERENCE_SRGB = np.array([
-    # Row 1
-    [115,  82,  68],   # 1  Dark Skin
-    [194, 150, 130],   # 2  Light Skin
-    [ 98, 122, 157],   # 3  Blue Sky
-    [ 87, 108,  67],   # 4  Foliage
-    [133, 128, 177],   # 5  Blue Flower
-    [103, 189, 170],   # 6  Bluish Green
-    # Row 2
-    [214, 126,  44],   # 7  Orange
-    [ 80,  91, 166],   # 8  Purplish Blue
-    [193,  90,  99],   # 9  Moderate Red
-    [ 94,  60, 108],   # 10 Purple
-    [157, 188,  64],   # 11 Yellow Green
-    [224, 163,  46],   # 12 Orange Yellow
-    # Row 3
-    [ 56,  61, 150],   # 13 Blue
-    [ 70, 148,  73],   # 14 Green
-    [175,  54,  60],   # 15 Red
-    [231, 199,  31],   # 16 Yellow
-    [187,  86, 149],   # 17 Magenta
-    [  8, 133, 161],   # 18 Cyan
-    # Row 4 (neutral patches)
-    [243, 243, 242],   # 19 White
-    [200, 200, 200],   # 20 Neutral 8
-    [160, 160, 160],   # 21 Neutral 6.5
-    [122, 122, 121],   # 22 Neutral 5
-    [ 85,  85,  85],   # 23 Neutral 3.5
-    [ 52,  52,  52],   # 24 Black
-], dtype=np.float32) / 255.0   # normalise to [0, 1]
+# Rather than hard-code an sRGB table (the previous one matched the pre-2014
+# colorants and was off by up to ~18/255 on the saturated patches - worst on
+# blue), we keep the *authoritative* CIE xyY data and derive sRGB from it, so
+# the reference is traceable to source and unambiguous.
+#
+# These are the X-Rite published values for the "After November 2014"
+# formulation - the colorants in every ColorChecker Classic made since, so the
+# right ones for a current chart. Values via the colour-science dataset
+# (ColorChecker24 - After November 2014), CIE 1931 2-degree observer, ICC D50.
+# Order: dark skin -> black, matching the patch layout (text at top).
+_COLORCHECKER_XYY_D50 = np.array([
+    [0.4325, 0.3788, 0.1034],  # 1  Dark Skin
+    [0.4191, 0.3748, 0.3525],  # 2  Light Skin
+    [0.2761, 0.3004, 0.1847],  # 3  Blue Sky
+    [0.3700, 0.4501, 0.1335],  # 4  Foliage
+    [0.3020, 0.2877, 0.2324],  # 5  Blue Flower
+    [0.2856, 0.3910, 0.4174],  # 6  Bluish Green
+    [0.5291, 0.4075, 0.3117],  # 7  Orange
+    [0.2339, 0.2155, 0.1140],  # 8  Purplish Blue
+    [0.5008, 0.3293, 0.1979],  # 9  Moderate Red
+    [0.3326, 0.2556, 0.0644],  # 10 Purple
+    [0.3989, 0.4998, 0.4435],  # 11 Yellow Green
+    [0.4962, 0.4428, 0.4358],  # 12 Orange Yellow
+    [0.2040, 0.1696, 0.0579],  # 13 Blue
+    [0.3270, 0.5033, 0.2307],  # 14 Green
+    [0.5709, 0.3298, 0.1268],  # 15 Red
+    [0.4694, 0.4732, 0.6081],  # 16 Yellow
+    [0.4177, 0.2704, 0.2007],  # 17 Magenta
+    [0.2151, 0.3037, 0.1903],  # 18 Cyan
+    [0.3488, 0.3628, 0.9129],  # 19 White 9.5
+    [0.3451, 0.3596, 0.5885],  # 20 Neutral 8
+    [0.3446, 0.3590, 0.3595],  # 21 Neutral 6.5
+    [0.3438, 0.3589, 0.1912],  # 22 Neutral 5
+    [0.3423, 0.3576, 0.0893],  # 23 Neutral 3.5
+    [0.3439, 0.3565, 0.0320],  # 24 Black 2
+], dtype=np.float64)
+
+# Bradford chromatic adaptation D50 -> D65, and CIE XYZ (D65) -> linear sRGB
+# (Lindbloom / sRGB spec). The chart data is D50; sRGB is a D65 space.
+_BRADFORD_D50_TO_D65 = np.array([
+    [0.9555766, -0.0230393, 0.0631636],
+    [-0.0282895, 1.0099416, 0.0210077],
+    [0.0122982, -0.0204830, 1.3299098],
+])
+_XYZ_D65_TO_LINEAR_SRGB = np.array([
+    [3.2404542, -1.5371385, -0.4985314],
+    [-0.9692660, 1.8760108, 0.0415560],
+    [0.0556434, -0.2040259, 1.0572252],
+])
+
+
+def _xyy_d50_to_srgb(xyY: np.ndarray) -> np.ndarray:
+    """CIE xyY (D50) -> gamma-encoded sRGB in [0, 1]. Out-of-gamut patches (the
+    chart's blue/cyan fall outside sRGB) are clipped after the linear transform,
+    as any sRGB rendering of the chart must."""
+    x, y, big_y = xyY[:, 0], xyY[:, 1], xyY[:, 2]
+    xyz = np.stack([big_y * x / y, big_y, big_y * (1.0 - x - y) / y], axis=1)
+    xyz_d65 = xyz @ _BRADFORD_D50_TO_D65.T
+    linear = np.clip(xyz_d65 @ _XYZ_D65_TO_LINEAR_SRGB.T, 0.0, 1.0)
+    return linear_to_srgb(linear).astype(np.float32)
+
+
+# Gamma-encoded sRGB [0, 1], dark skin -> black; the CCM fit and the
+# neutral-brightness readout both reference this.
+REFERENCE_SRGB = _xyy_d50_to_srgb(_COLORCHECKER_XYY_D50)
 
 
 # Canonical sRGB transfer functions live in image_io so the decode/export path
@@ -710,6 +748,14 @@ class ColorCorrection(Camera, EasyResource):
         if tone is not None and tone not in TONE_OPTIONS:
             raise ValueError(f"`tone` must be one of {list(TONE_OPTIONS)}")
 
+        sharpen = attrs.get("sharpen")
+        if sharpen is not None and sharpen not in SHARPEN_OPTIONS:
+            raise ValueError(f"`sharpen` must be one of {list(SHARPEN_OPTIONS)}")
+
+        demosaic = attrs.get("demosaic")
+        if demosaic is not None and demosaic not in DEMOSAIC_ALGORITHMS:
+            raise ValueError(f"`demosaic` must be one of {list(DEMOSAIC_ALGORITHMS)}")
+
         return [str(camera)], []
 
     def reconfigure(
@@ -754,6 +800,13 @@ class ColorCorrection(Camera, EasyResource):
         # midtones for a Capture One-style punch (the CCM/hue is untouched - only
         # lightness/contrast changes). Applied to every export and the preview.
         self._tone: str = attrs.get("tone") or "none"
+        # Capture sharpening ("none"/"light"/"medium"/"strong"): RAW is soft
+        # before sharpening, so an unsharpened export looks blurry next to a
+        # Capture One / Lightroom render. Default "none" (opt-in). And the
+        # demosaic algorithm used to decode RAW (DHT default - sharper than
+        # libraw's stock AHD). Both feed every export and the preview.
+        self._sharpen: str = attrs.get("sharpen") or "none"
+        self._demosaic: str = attrs.get("demosaic") or DEFAULT_DEMOSAIC
         self._write_sidecar: bool = bool(attrs.get("write_sidecar", True))
 
         # Local-disk hygiene, mirroring ptp's `delete_after_download`: once a
@@ -928,6 +981,7 @@ class ColorCorrection(Camera, EasyResource):
             linear = load_linear_rgb(
                 str(path), white_balance=white_balance,
                 exposure_stops=exposure_stops, half_size=half_size,
+                demosaic=self._demosaic,
             )
             return linear, str(path)
 
@@ -951,7 +1005,9 @@ class ColorCorrection(Camera, EasyResource):
         on the source, prefer its ``saved_to`` RAW) -> the streaming frame.
         """
         def _file_to_rgb8(p: str) -> np.ndarray:
-            linear = load_linear_rgb(str(p), white_balance="camera")
+            linear = load_linear_rgb(
+                str(p), white_balance="camera", demosaic=self._demosaic
+            )
             return (linear_to_srgb(linear) * 255.0).clip(0, 255).astype(np.uint8)
 
         path = opts.get("path")
@@ -1069,6 +1125,7 @@ class ColorCorrection(Camera, EasyResource):
                 raw_path,
                 white_balance=(wb if wb is not None else "camera"),
                 user_flip=0,  # match detect_img so `centers` line up
+                demosaic=self._demosaic,
             )
             measured_linear = PatchSampler.sample_linear_at_centers(linear, centers, radius)
         else:
@@ -1148,6 +1205,9 @@ class ColorCorrection(Camera, EasyResource):
           ``exposure_stops``   exposure compensation applied at the raw stage
           ``tone``             delivery look: "none" (colour-accurate) | "medium"
                                | "bright" (Capture One-style midtone lift)
+          ``sharpen``          capture sharpening: "none" | "light" | "medium"
+                               | "strong"
+          ``demosaic``         RAW demosaic algorithm (DHT/AHD/AAHD/DCB/VNG/PPG)
           ``output_formats``   subset of tiff16/tiff8/jpeg/png16/png8; pass []
                                to skip exports (preview-only capture - develop
                                the RAW later with the ``develop`` command)
@@ -1174,6 +1234,7 @@ class ColorCorrection(Camera, EasyResource):
         formats = list(opts.get("output_formats", self._output_formats))
         out_dir_override = opts.get("output_dir") or self._output_dir
         tone = opts.get("tone", self._tone)
+        sharpen = opts.get("sharpen", self._sharpen)
         # When nothing is being exported, the decode only feeds the preview -
         # a half-resolution demosaic is ~4x faster and indistinguishable there.
         preview_only = not formats
@@ -1200,7 +1261,7 @@ class ColorCorrection(Camera, EasyResource):
         result = await asyncio.to_thread(
             self._develop_one,
             linear, source_path, white_balance, exposure_stops, formats,
-            out_dir_override, True, tone,
+            out_dir_override, True, tone, sharpen,
         )
         self.logger.debug(
             f"[timing] capture pipeline total: {time.perf_counter() - start:.2f}s"
@@ -1220,6 +1281,7 @@ class ColorCorrection(Camera, EasyResource):
         white_balance = opts.get("white_balance", self._white_balance)
         exposure_stops = float(opts.get("exposure_stops", self._exposure_stops))
         tone = opts.get("tone", self._tone)
+        sharpen = opts.get("sharpen", self._sharpen)
 
         start = time.perf_counter()
         try:
@@ -1245,7 +1307,8 @@ class ColorCorrection(Camera, EasyResource):
         capture_id = f"{self._capture_seq}-{stem}"
         self._pending_captures[capture_id] = asyncio.create_task(
             self._finish_deferred_capture(
-                capture_id, str(camera_path), white_balance, exposure_stops, tone
+                capture_id, str(camera_path), white_balance, exposure_stops,
+                tone, sharpen,
             )
         )
         # Drop completed-and-collected stragglers if a caller never fetched
@@ -1269,6 +1332,7 @@ class ColorCorrection(Camera, EasyResource):
         white_balance: Any,
         exposure_stops: float,
         tone: Optional[str] = None,
+        sharpen: Optional[str] = None,
     ) -> Dict[str, ValueTypes]:
         """Background half of a deferred capture: download the still from the
         camera, decode at half size, apply the CCM, and build the preview. No
@@ -1285,10 +1349,12 @@ class ColorCorrection(Camera, EasyResource):
         linear = await asyncio.to_thread(
             load_linear_rgb, str(saved),
             white_balance=white_balance, exposure_stops=exposure_stops,
-            half_size=True,
+            half_size=True, demosaic=self._demosaic,
         )
         corrected = await asyncio.to_thread(self.corrector.apply_to_linear, linear)
-        preview = await asyncio.to_thread(linear_to_jpeg_base64, corrected, tone=tone)
+        preview = await asyncio.to_thread(
+            linear_to_jpeg_base64, corrected, tone=tone, sharpen=sharpen
+        )
         self.logger.debug(
             f"[timing] deferred capture {capture_id} background "
             f"(download + decode + preview): {time.perf_counter() - start:.2f}s"
@@ -1350,6 +1416,8 @@ class ColorCorrection(Camera, EasyResource):
           ``white_balance``  "camera" (default) | "auto" | "daylight" | [r,g,b,g2]
           ``exposure_stops`` exposure compensation applied at the raw stage
           ``tone``           delivery look: "none" | "medium" | "bright"
+          ``sharpen``        capture sharpening: "none"|"light"|"medium"|"strong"
+          ``demosaic``       RAW demosaic algorithm (DHT/AHD/AAHD/DCB/VNG/PPG)
           ``output_formats`` subset of tiff16/tiff8/jpeg/png16/png8
           ``output_dir``     where to write exports (default: next to each file)
         """
@@ -1369,6 +1437,7 @@ class ColorCorrection(Camera, EasyResource):
         formats = list(opts.get("output_formats", self._output_formats))
         out_dir_override = opts.get("output_dir") or self._output_dir
         tone = opts.get("tone", self._tone)
+        sharpen = opts.get("sharpen", self._sharpen)
 
         results: List[Mapping[str, ValueTypes]] = []
         for path in paths:
@@ -1378,6 +1447,7 @@ class ColorCorrection(Camera, EasyResource):
             linear = await asyncio.to_thread(
                 load_linear_rgb,
                 path, white_balance=white_balance, exposure_stops=exposure_stops,
+                demosaic=self._demosaic,
             )
             results.append(
                 await asyncio.to_thread(
@@ -1388,6 +1458,7 @@ class ColorCorrection(Camera, EasyResource):
                     # response small; a single develop still returns its preview.
                     include_preview=single,
                     tone=tone,
+                    sharpen=sharpen,
                 )
             )
             self.logger.debug(
@@ -1409,6 +1480,7 @@ class ColorCorrection(Camera, EasyResource):
         out_dir_override: Optional[str],
         include_preview: bool = True,
         tone: Optional[str] = None,
+        sharpen: Optional[str] = None,
     ) -> Dict[str, ValueTypes]:
         """
         Shared core for ``capture`` and ``develop``: apply the CCM in linear
@@ -1441,7 +1513,7 @@ class ColorCorrection(Camera, EasyResource):
             t_export = time.perf_counter()
             exports = export_renditions(
                 corrected, out_dir, stem, formats,
-                quality=self._jpeg_quality, tone=tone,
+                quality=self._jpeg_quality, tone=tone, sharpen=sharpen,
             )
             self.logger.debug(
                 f"[timing] export {len(exports)} format(s): "
@@ -1457,7 +1529,8 @@ class ColorCorrection(Camera, EasyResource):
         sidecar = None
         if self._write_sidecar and source_path:
             sidecar = self._write_sidecar_file(
-                source_path, white_balance, exposure_stops, formats, exports, tone
+                source_path, white_balance, exposure_stops, formats, exports,
+                tone, sharpen,
             )
 
         result: Dict[str, ValueTypes] = {
@@ -1468,7 +1541,9 @@ class ColorCorrection(Camera, EasyResource):
             "color_space": "sRGB",
         }
         if include_preview:
-            result["image_base64"] = linear_to_jpeg_base64(corrected, tone=tone)
+            result["image_base64"] = linear_to_jpeg_base64(
+                corrected, tone=tone, sharpen=sharpen
+            )
             result["mime_type"] = CameraMimeType.JPEG.value
         return result
 
@@ -1480,6 +1555,7 @@ class ColorCorrection(Camera, EasyResource):
         formats: Sequence[str],
         exports: Mapping[str, str],
         tone: Optional[str] = None,
+        sharpen: Optional[str] = None,
     ) -> str:
         """
         Write a ``<stem>.json`` sidecar next to the (untouched) source file
@@ -1493,6 +1569,8 @@ class ColorCorrection(Camera, EasyResource):
             "white_balance": white_balance,
             "exposure_stops": exposure_stops,
             "tone": tone or "none",
+            "sharpen": sharpen or "none",
+            "demosaic": self._demosaic,
             "ccm": self.corrector.ccm.tolist(),
             "ccm_applied": not self.corrector.is_identity,
             "color_space": "sRGB",

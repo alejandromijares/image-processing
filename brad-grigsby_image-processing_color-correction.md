@@ -64,6 +64,8 @@ installs those automatically on Debian/Ubuntu.
 | `white_balance`  | string/array | Optional  | RAW white balance: `camera` (default), `auto`, `daylight`, or `[r,g,b,g2]` multipliers. |
 | `exposure_stops` | number       | Optional  | Default exposure compensation (stops) applied at the raw stage. Paste the value `calibrate_color` reports to render captures at the calibrated reference brightness. Default `0`. A per-call `exposure_stops` overrides it. |
 | `tone`           | string       | Optional  | Delivery "look" applied on export: `none` (default — colour-accurate / colorimetric output), `medium`, or `bright` (a Capture One-style midtone lift). Only lightness/contrast changes — the CCM keeps hue accurate. Applied to every export and the preview; recorded in the sidecar. A per-call `tone` overrides it. |
+| `sharpen`        | string       | Optional  | Capture sharpening (luminance unsharp mask): `none` (default), `light`, `medium`, `strong`. RAW is soft before sharpening, so an unsharpened export looks blurry next to a Capture One / Lightroom render. Applied to every export and the preview; recorded in the sidecar. A per-call `sharpen` overrides it. |
+| `demosaic`       | string       | Optional  | RAW demosaic algorithm: `DHT` (default — sharper than libraw's stock AHD), or `AHD`/`AAHD`/`DCB`/`VNG`/`PPG`. (AMAZE/LMMSE need GPL demosaic packs not bundled in the libraw wheels.) A per-call `demosaic` overrides it. |
 | `write_sidecar`  | boolean      | Optional  | Write a `<name>.json` sidecar recording the development. Default `true`.                |
 | `part_id`        | string       | Optional  | Machine part to attach `upload`s to. Defaults to `VIAM_MACHINE_PART_ID` from the env.   |
 | `delete_after_upload` | boolean | Optional  | Remove each local file once its `upload` succeeds (failed uploads keep their files for retry). Default `false`. |
@@ -132,8 +134,15 @@ pipeline, and writes the exports + sidecar. Returns a small base64 JPEG
 
 Options (all optional): `capture_options` (forwarded to the source's `capture`),
 `white_balance`, `exposure_stops` (exposure compensation applied at the raw
-stage), `tone` (delivery look: `none`/`medium`/`bright`), `output_formats`,
-`output_dir`. Each overrides the config default for this call.
+stage), `tone` (delivery look: `none`/`medium`/`bright`), `sharpen` (capture
+sharpening: `none`/`light`/`medium`/`strong`), `demosaic` (RAW demosaic
+algorithm), `output_formats`, `output_dir`. Each overrides the config default
+for this call.
+
+> **Sharpness:** RAW captures are soft before sharpening — every developer
+> (Capture One, Lightroom) applies a default capture sharpen, so an unsharpened
+> export looks blurry next to theirs. Set `sharpen: medium` to match. The
+> `demosaic` default (`DHT`) is also sharper than libraw's stock AHD.
 
 > **Accurate vs. the Capture One look:** with `tone: none` (default) the pipeline
 > is colorimetric — a mid-grey card lands on its true sRGB value (~160), which

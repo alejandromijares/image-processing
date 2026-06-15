@@ -167,15 +167,32 @@ def test_calibrate_from_rgb_corrects_a_cast():
 
 
 def test_neutral_brightness_report_at_nominal_matches_reference():
-    """Patches measured at exactly the reference colors read back the
-    reference 0-255 values (e.g. Neutral 6.5 -> 160)."""
+    """Patches measured at exactly the reference colors read back the reference
+    0-255 values. Neutral 6.5 lands at ~161 (the real "After November 2014"
+    chart's grey isn't exactly 160 - it's derived from the published xyY)."""
     report = _neutral_brightness_report(srgb_to_linear(REFERENCE_SRGB))
     assert set(report) == {
         "white_9_5", "neutral_8", "neutral_6_5", "neutral_5", "neutral_3_5", "black_2"
     }
     for patch in report.values():
         assert patch["measured"] == pytest.approx(patch["reference"], abs=0.5)
-    assert report["neutral_6_5"]["reference"] == pytest.approx(160.0, abs=0.5)
+    assert report["neutral_6_5"]["reference"] == pytest.approx(161.4, abs=1.0)
+
+
+def test_reference_srgb_derived_from_after_nov2014_xyy():
+    """REFERENCE_SRGB is computed from the published xyY (After Nov 2014) data,
+    not the stale pre-2014 sRGB table."""
+    srgb = REFERENCE_SRGB * 255.0
+    assert REFERENCE_SRGB.shape == (24, 3)
+    assert REFERENCE_SRGB.min() >= 0.0 and REFERENCE_SRGB.max() <= 1.0
+    # Neutral row (19-23) stays near-neutral (white carries a slight real warm
+    # tint), at ~91%-reflectance white (not 255).
+    for idx in range(18, 24):
+        r, g, b = srgb[idx]
+        assert max(r, g, b) - min(r, g, b) < 6.0
+    assert srgb[18].mean() == pytest.approx(245, abs=2)   # white ~245, not 255
+    # The post-2014 fix: blue patch (13) red channel ~38, NOT the stale 56.
+    assert srgb[12, 0] == pytest.approx(38, abs=3)
 
 
 def test_neutral_brightness_report_tracks_light_power():
@@ -299,6 +316,8 @@ def _component(source, output_dir=None):
     cc._white_balance = "camera"
     cc._exposure_stops = 0.0
     cc._tone = "none"
+    cc._sharpen = "none"
+    cc._demosaic = "DHT"
     cc._output_formats = ["tiff16", "jpeg"]
     cc._output_dir = output_dir
     cc._jpeg_quality = 95

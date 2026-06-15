@@ -206,6 +206,12 @@ class _FakeRawpy:
     class ColorSpace:
         sRGB = "srgb"
 
+    class DemosaicAlgorithm:
+        class _Algo:
+            isSupported = True
+        DHT = _Algo()
+        AHD = _Algo()
+
     def __init__(self):
         self.postprocess_kwargs = None
 
@@ -236,9 +242,13 @@ def test_load_linear_rgb_half_size_passthrough(tmp_path, monkeypatch):
 
     load_linear_rgb(str(raw_path), half_size=True)
     assert fake.postprocess_kwargs["half_size"] is True
+    # half_size bins the CFA, so no demosaic algorithm is requested.
+    assert "demosaic_algorithm" not in fake.postprocess_kwargs
 
     load_linear_rgb(str(raw_path))
     assert "half_size" not in fake.postprocess_kwargs
+    # full-size decode requests the configured demosaic algorithm.
+    assert fake.postprocess_kwargs["demosaic_algorithm"] is _FakeRawpy.DemosaicAlgorithm.DHT
 
 
 # ---------------------------------------------------------------------------
@@ -291,3 +301,61 @@ def test_export_applies_tone_curve(tmp_path):
     b = np.array(_Image.open(bright["tiff8"]))
     assert round(float(n.mean())) == 160          # accurate: unchanged
     assert float(b.mean()) > 195                   # lifted toward Capture One's ~200
+
+
+# ---------------------------------------------------------------------------
+# Capture sharpening / demosaic selection
+# ---------------------------------------------------------------------------
+
+from models.image_io import (  # noqa: E402
+    DEMOSAIC_ALGORITHMS,
+    SHARPEN_OPTIONS,
+    _demosaic_algorithm,
+    apply_sharpen,
+)
+
+
+def test_sharpen_none_is_identity():
+    img = np.random.default_rng(0).uniform(0, 1, (16, 16, 3)).astype(np.float32)
+    assert np.array_equal(apply_sharpen(img, "none"), img)
+    assert np.array_equal(apply_sharpen(img, None), img)
+
+
+def test_sharpen_overshoots_at_an_edge():
+    """Unsharp mask must add halo overshoot at a step edge (values pushed past
+    both sides), and stronger presets overshoot more."""
+    img = np.full((8, 16, 3), 0.3, dtype=np.float32)
+    img[:, 8:] = 0.6
+    prev_over = 0.0
+    for preset in ("light", "medium", "strong"):
+        out = apply_sharpen(img, preset)
+        assert out.max() > 0.6 and out.min() < 0.3        # halo on both sides
+        over = float(out.max() - 0.6)
+        assert over > prev_over                            # monotonic with strength
+        prev_over = over
+        assert out.min() >= 0.0 and out.max() <= 1.0       # stays in range
+
+
+def test_sharpen_rejects_unknown():
+    with pytest.raises(ValueError, match="unknown sharpen"):
+        apply_sharpen(np.zeros((4, 4, 3), np.float32), "extra-crispy")
+
+
+def test_sharpen_is_luminance_only_no_chroma_shift():
+    """A neutral (grey) ramp must stay neutral after sharpening - the luma-only
+    unsharp mask adds the same detail to R, G, B, so no colour fringing."""
+    grey = np.linspace(0.2, 0.8, 16, dtype=np.float32)
+    img = np.repeat(np.stack([grey, grey, grey], -1)[None], 8, 0)
+    out = apply_sharpen(img, "strong")
+    assert np.allclose(out[..., 0], out[..., 1]) and np.allclose(out[..., 1], out[..., 2])
+
+
+def test_demosaic_algorithm_resolves_and_validates():
+    # Real rawpy here: the supported defaults resolve; junk and GPL-only names raise.
+    for name in DEMOSAIC_ALGORITHMS:
+        assert _demosaic_algorithm(name) is not None
+    with pytest.raises(ValueError, match="unknown demosaic"):
+        _demosaic_algorithm("AMAZE")   # excluded (needs GPL pack)
+    with pytest.raises(ValueError, match="unknown demosaic"):
+        _demosaic_algorithm("nope")
+    assert "none" in SHARPEN_OPTIONS and "DHT" in DEMOSAIC_ALGORITHMS

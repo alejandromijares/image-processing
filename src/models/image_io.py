@@ -82,6 +82,14 @@ except Exception as exc:  # pragma: no cover - depends on the host
 # as a finished RGB image. Mirrors the RAW extensions ptp.py lists.
 RAW_EXTS = (".cr3", ".cr2", ".nef", ".arw", ".raf", ".dng", ".rw2", ".orf")
 
+# Demosaic algorithms we expose, by rawpy.DemosaicAlgorithm name. RAW is soft
+# before demosaic; the algorithm choice trades sharpness against artifacts.
+# DHT is a high-quality default (sharper than libraw's stock AHD with few maze
+# artifacts). AMAZE/LMMSE are deliberately omitted: they need the GPL2/GPL3
+# demosaic packs that the bundled libraw wheels don't ship.
+DEMOSAIC_ALGORITHMS = ("DHT", "AHD", "AAHD", "DCB", "VNG", "PPG")
+DEFAULT_DEMOSAIC = "DHT"
+
 # Export format keys -> (file-name suffix, bit depth). 16-bit variants are
 # tagged ``_16`` so they don't collide with their 8-bit siblings in one folder.
 EXPORT_FORMATS: Dict[str, Dict[str, object]] = {
@@ -126,6 +134,22 @@ def is_raw(path: str) -> bool:
 # Decode
 # ---------------------------------------------------------------------------
 
+def _demosaic_algorithm(name: str):
+    """Resolve a demosaic name to a ``rawpy.DemosaicAlgorithm``, with a clean
+    error if the bundled libraw can't do it (e.g. the GPL-only AMAZE/LMMSE)."""
+    if name not in DEMOSAIC_ALGORITHMS:
+        raise ValueError(
+            f"unknown demosaic {name!r}; valid: {', '.join(DEMOSAIC_ALGORITHMS)}"
+        )
+    algo = getattr(rawpy.DemosaicAlgorithm, name)
+    if not getattr(algo, "isSupported", True):
+        raise RuntimeError(
+            f"demosaic {name!r} isn't available in this libraw build; "
+            f"choose another of {', '.join(DEMOSAIC_ALGORITHMS)}"
+        )
+    return algo
+
+
 def _rawpy_wb_kwargs(white_balance: Union[str, Sequence[float], None]) -> dict:
     """Translate a white-balance option into rawpy.postprocess kwargs."""
     if white_balance is None or white_balance in ("none", "daylight"):
@@ -153,6 +177,7 @@ def load_linear_rgb(
     exposure_stops: float = 0.0,
     user_flip: Optional[int] = None,
     half_size: bool = False,
+    demosaic: str = DEFAULT_DEMOSAIC,
 ) -> np.ndarray:
     """
     Load an image file into a **linear-light** float32 RGB array in [0, 1],
@@ -196,6 +221,9 @@ def load_linear_rgb(
             output_color=rawpy.ColorSpace.sRGB,
         )
         kwargs.update(_rawpy_wb_kwargs(white_balance))
+        if not half_size:
+            # half_size bins each 2x2 CFA quad, so there's nothing to demosaic.
+            kwargs["demosaic_algorithm"] = _demosaic_algorithm(demosaic)
         if exposure_stops:
             # exp_shift is a linear multiplier (rawpy enables the exposure
             # correction automatically when it's set); libraw clamps it to [0.25, 8].
@@ -424,21 +452,65 @@ def apply_tone_curve(srgb01: np.ndarray, tone: Optional[str]) -> np.ndarray:
     return np.interp(np.clip(srgb01, 0.0, 1.0), grid, lut).astype(np.float32)
 
 
-def _encode_srgb(linear_rgb: np.ndarray, bits: int, tone: Optional[str] = None) -> np.ndarray:
+# ---------------------------------------------------------------------------
+# Capture sharpening
+# ---------------------------------------------------------------------------
+# RAW is soft before sharpening - every raw developer (Capture One, Lightroom)
+# applies a default capture sharpen, which is why an unsharpened export looks
+# blurry next to theirs. This is a luminance-only unsharp mask: the high-pass is
+# computed on luma and added back to all channels, so edges crisp up without the
+# colour fringing per-channel sharpening causes. Presets are (amount, sigma_px);
+# sigma is at full export resolution. ``none`` (default) is off.
+SHARPEN_OPTIONS: Tuple[str, ...] = ("none", "light", "medium", "strong")
+_SHARPEN_PRESETS: Dict[str, Tuple[float, float]] = {
+    "light":  (0.5, 0.8),
+    "medium": (1.0, 0.9),
+    "strong": (1.6, 1.1),
+}
+_LUMA = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
+
+
+def apply_sharpen(srgb01: np.ndarray, sharpen: Optional[str]) -> np.ndarray:
+    """Luminance unsharp-mask on gamma-encoded sRGB [0,1]. ``None``/``"none"``
+    is a no-op."""
+    if not sharpen or sharpen == "none":
+        return srgb01
+    if sharpen not in _SHARPEN_PRESETS:
+        raise ValueError(
+            f"unknown sharpen {sharpen!r}; valid: {', '.join(SHARPEN_OPTIONS)}"
+        )
+    if cv2 is None:
+        raise RuntimeError(
+            f"capture sharpening needs OpenCV, which isn't available "
+            f"({_CV2_IMPORT_ERROR}); install `opencv-python-headless`"
+        )
+    amount, sigma = _SHARPEN_PRESETS[sharpen]
+    luma = srgb01 @ _LUMA
+    blurred = cv2.GaussianBlur(luma, (0, 0), sigmaX=sigma, sigmaY=sigma)
+    detail = (luma - blurred)[..., None]
+    return np.clip(srgb01 + amount * detail, 0.0, 1.0).astype(np.float32)
+
+
+def _encode_srgb(
+    linear_rgb: np.ndarray, bits: int,
+    tone: Optional[str] = None, sharpen: Optional[str] = None,
+) -> np.ndarray:
     """Linear float RGB -> sRGB-gamma integer array at the given bit depth,
-    optionally through a delivery ``tone`` curve (applied in sRGB space)."""
-    srgb = apply_tone_curve(linear_to_srgb(linear_rgb), tone)
+    optionally through a delivery ``tone`` curve and a capture ``sharpen`` pass
+    (both applied in sRGB space)."""
+    srgb = apply_sharpen(apply_tone_curve(linear_to_srgb(linear_rgb), tone), sharpen)
     if bits == 16:
         return np.rint(srgb * 65535.0).clip(0, 65535).astype(np.uint16)
     return np.rint(srgb * 255.0).clip(0, 255).astype(np.uint8)
 
 
 def _write_one(
-    linear_rgb: np.ndarray, dest: str, fmt: str, quality: int, tone: Optional[str] = None
+    linear_rgb: np.ndarray, dest: str, fmt: str, quality: int,
+    tone: Optional[str] = None, sharpen: Optional[str] = None,
 ) -> str:
     spec = EXPORT_FORMATS[fmt]
     bits = int(spec["bits"])
-    data = _encode_srgb(linear_rgb, bits, tone)
+    data = _encode_srgb(linear_rgb, bits, tone, sharpen)
     icc = _srgb_icc_bytes()
 
     if fmt == "tiff16":
@@ -483,11 +555,13 @@ def export_renditions(
     *,
     quality: int = 95,
     tone: Optional[str] = None,
+    sharpen: Optional[str] = None,
 ) -> Dict[str, str]:
     """
     Write ``linear_rgb`` (linear float RGB) to ``out_dir/<stem><suffix>`` for
     each requested format. Returns {format_key: written_path}. ``tone`` applies
-    an optional delivery tone curve (see ``apply_tone_curve``) to every export.
+    an optional delivery tone curve (see ``apply_tone_curve``) and ``sharpen`` a
+    capture unsharp mask (see ``apply_sharpen``) to every export.
     """
     unknown = [f for f in formats if f not in EXPORT_FORMATS]
     if unknown:
@@ -499,13 +573,13 @@ def export_renditions(
     for fmt in formats:
         dest = os.path.join(out_dir, stem + str(EXPORT_FORMATS[fmt]["suffix"]))
         with log_duration(LOGGER, f"export {fmt} -> {os.path.basename(dest)}"):
-            written[fmt] = _write_one(linear_rgb, dest, fmt, quality, tone)
+            written[fmt] = _write_one(linear_rgb, dest, fmt, quality, tone, sharpen)
     return written
 
 
 def linear_to_jpeg_base64(
     linear_rgb: np.ndarray, max_dim: int = 1024, quality: int = 90,
-    tone: Optional[str] = None,
+    tone: Optional[str] = None, sharpen: Optional[str] = None,
 ) -> str:
     """
     Small sRGB JPEG preview (base64) for the control tab / DoCommand response -
@@ -523,7 +597,7 @@ def linear_to_jpeg_base64(
         stride = max(1, max(h, w) // (2 * max_dim))
         if stride > 1:
             linear_rgb = linear_rgb[::stride, ::stride]
-        rgb8 = _encode_srgb(linear_rgb, 8, tone)
+        rgb8 = _encode_srgb(linear_rgb, 8, tone, sharpen)
         img = Image.fromarray(rgb8)
         img.thumbnail((max_dim, max_dim))
         buf = BytesIO()
