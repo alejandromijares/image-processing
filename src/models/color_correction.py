@@ -51,7 +51,9 @@ Two ways to get corrected images out of this component:
    ``output_formats`` (default ["tiff16", "jpeg", "png16", "png8"]),
    ``jpeg_quality`` (95), ``white_balance`` ("camera"), ``exposure_stops`` (0.0 -
    paste the value `calibrate_color` reports to render at the calibrated
-   brightness), ``write_sidecar`` (true), ``delete_after_upload`` (false).
+   brightness), ``tone`` ("none" - delivery look: "none" is colour-accurate /
+   colorimetric, "medium"/"bright" lift the midtones for a Capture One-style
+   punch), ``write_sidecar`` (true), ``delete_after_upload`` (false).
 
        {"develop": {"path": "/photos/IMG_0042.CR3"}}
        {"develop": {"paths": ["/photos/a.CR3", "/photos/b.CR3"]}}
@@ -133,6 +135,7 @@ from viam.utils import ValueTypes, struct_to_dict
 
 from models.image_io import (
     EXPORT_FORMATS,
+    TONE_OPTIONS,
     compute_raw_wb_multipliers,
     export_renditions,
     is_raw,
@@ -703,6 +706,10 @@ class ColorCorrection(Camera, EasyResource):
         if exposure_stops is not None and not isinstance(exposure_stops, (int, float)):
             raise ValueError("`exposure_stops` must be a number (stops of exposure)")
 
+        tone = attrs.get("tone")
+        if tone is not None and tone not in TONE_OPTIONS:
+            raise ValueError(f"`tone` must be one of {list(TONE_OPTIONS)}")
+
         return [str(camera)], []
 
     def reconfigure(
@@ -742,6 +749,11 @@ class ColorCorrection(Camera, EasyResource):
         # brightness when the flash can't reach the reference optically. Per-call
         # `exposure_stops` on capture/develop still overrides this.
         self._exposure_stops: float = float(attrs.get("exposure_stops", 0.0))
+        # Optional delivery "look" layered on the colour-accurate render: "none"
+        # (default) is pure colorimetric output; "medium"/"bright" lift the
+        # midtones for a Capture One-style punch (the CCM/hue is untouched - only
+        # lightness/contrast changes). Applied to every export and the preview.
+        self._tone: str = attrs.get("tone") or "none"
         self._write_sidecar: bool = bool(attrs.get("write_sidecar", True))
 
         # Local-disk hygiene, mirroring ptp's `delete_after_download`: once a
@@ -1120,6 +1132,8 @@ class ColorCorrection(Camera, EasyResource):
           ``capture_options``  forwarded to the source's ``capture`` (e.g. {"af": true})
           ``white_balance``    "camera" (default) | "auto" | "daylight" | [r,g,b,g2]
           ``exposure_stops``   exposure compensation applied at the raw stage
+          ``tone``             delivery look: "none" (colour-accurate) | "medium"
+                               | "bright" (Capture One-style midtone lift)
           ``output_formats``   subset of tiff16/tiff8/jpeg/png16/png8; pass []
                                to skip exports (preview-only capture - develop
                                the RAW later with the ``develop`` command)
@@ -1145,6 +1159,7 @@ class ColorCorrection(Camera, EasyResource):
         exposure_stops = float(opts.get("exposure_stops", self._exposure_stops))
         formats = list(opts.get("output_formats", self._output_formats))
         out_dir_override = opts.get("output_dir") or self._output_dir
+        tone = opts.get("tone", self._tone)
         # When nothing is being exported, the decode only feeds the preview -
         # a half-resolution demosaic is ~4x faster and indistinguishable there.
         preview_only = not formats
@@ -1171,7 +1186,7 @@ class ColorCorrection(Camera, EasyResource):
         result = await asyncio.to_thread(
             self._develop_one,
             linear, source_path, white_balance, exposure_stops, formats,
-            out_dir_override,
+            out_dir_override, True, tone,
         )
         self.logger.debug(
             f"[timing] capture pipeline total: {time.perf_counter() - start:.2f}s"
@@ -1190,6 +1205,7 @@ class ColorCorrection(Camera, EasyResource):
         """
         white_balance = opts.get("white_balance", self._white_balance)
         exposure_stops = float(opts.get("exposure_stops", self._exposure_stops))
+        tone = opts.get("tone", self._tone)
 
         start = time.perf_counter()
         try:
@@ -1215,7 +1231,7 @@ class ColorCorrection(Camera, EasyResource):
         capture_id = f"{self._capture_seq}-{stem}"
         self._pending_captures[capture_id] = asyncio.create_task(
             self._finish_deferred_capture(
-                capture_id, str(camera_path), white_balance, exposure_stops
+                capture_id, str(camera_path), white_balance, exposure_stops, tone
             )
         )
         # Drop completed-and-collected stragglers if a caller never fetched
@@ -1238,6 +1254,7 @@ class ColorCorrection(Camera, EasyResource):
         camera_path: str,
         white_balance: Any,
         exposure_stops: float,
+        tone: Optional[str] = None,
     ) -> Dict[str, ValueTypes]:
         """Background half of a deferred capture: download the still from the
         camera, decode at half size, apply the CCM, and build the preview. No
@@ -1257,7 +1274,7 @@ class ColorCorrection(Camera, EasyResource):
             half_size=True,
         )
         corrected = await asyncio.to_thread(self.corrector.apply_to_linear, linear)
-        preview = await asyncio.to_thread(linear_to_jpeg_base64, corrected)
+        preview = await asyncio.to_thread(linear_to_jpeg_base64, corrected, tone=tone)
         self.logger.debug(
             f"[timing] deferred capture {capture_id} background "
             f"(download + decode + preview): {time.perf_counter() - start:.2f}s"
@@ -1318,6 +1335,7 @@ class ColorCorrection(Camera, EasyResource):
           ``paths``          a list of file paths (returns {"developed": [...]})
           ``white_balance``  "camera" (default) | "auto" | "daylight" | [r,g,b,g2]
           ``exposure_stops`` exposure compensation applied at the raw stage
+          ``tone``           delivery look: "none" | "medium" | "bright"
           ``output_formats`` subset of tiff16/tiff8/jpeg/png16/png8
           ``output_dir``     where to write exports (default: next to each file)
         """
@@ -1336,6 +1354,7 @@ class ColorCorrection(Camera, EasyResource):
         exposure_stops = float(opts.get("exposure_stops", self._exposure_stops))
         formats = list(opts.get("output_formats", self._output_formats))
         out_dir_override = opts.get("output_dir") or self._output_dir
+        tone = opts.get("tone", self._tone)
 
         results: List[Mapping[str, ValueTypes]] = []
         for path in paths:
@@ -1354,6 +1373,7 @@ class ColorCorrection(Camera, EasyResource):
                     # Skip the per-file base64 preview in batch mode to keep the
                     # response small; a single develop still returns its preview.
                     include_preview=single,
+                    tone=tone,
                 )
             )
             self.logger.debug(
@@ -1374,6 +1394,7 @@ class ColorCorrection(Camera, EasyResource):
         formats: Sequence[str],
         out_dir_override: Optional[str],
         include_preview: bool = True,
+        tone: Optional[str] = None,
     ) -> Dict[str, ValueTypes]:
         """
         Shared core for ``capture`` and ``develop``: apply the CCM in linear
@@ -1405,7 +1426,8 @@ class ColorCorrection(Camera, EasyResource):
         if out_dir:
             t_export = time.perf_counter()
             exports = export_renditions(
-                corrected, out_dir, stem, formats, quality=self._jpeg_quality
+                corrected, out_dir, stem, formats,
+                quality=self._jpeg_quality, tone=tone,
             )
             self.logger.debug(
                 f"[timing] export {len(exports)} format(s): "
@@ -1421,7 +1443,7 @@ class ColorCorrection(Camera, EasyResource):
         sidecar = None
         if self._write_sidecar and source_path:
             sidecar = self._write_sidecar_file(
-                source_path, white_balance, exposure_stops, formats, exports
+                source_path, white_balance, exposure_stops, formats, exports, tone
             )
 
         result: Dict[str, ValueTypes] = {
@@ -1432,7 +1454,7 @@ class ColorCorrection(Camera, EasyResource):
             "color_space": "sRGB",
         }
         if include_preview:
-            result["image_base64"] = linear_to_jpeg_base64(corrected)
+            result["image_base64"] = linear_to_jpeg_base64(corrected, tone=tone)
             result["mime_type"] = CameraMimeType.JPEG.value
         return result
 
@@ -1443,6 +1465,7 @@ class ColorCorrection(Camera, EasyResource):
         exposure_stops: float,
         formats: Sequence[str],
         exports: Mapping[str, str],
+        tone: Optional[str] = None,
     ) -> str:
         """
         Write a ``<stem>.json`` sidecar next to the (untouched) source file
@@ -1455,6 +1478,7 @@ class ColorCorrection(Camera, EasyResource):
             "created_utc": datetime.now(timezone.utc).isoformat(),
             "white_balance": white_balance,
             "exposure_stops": exposure_stops,
+            "tone": tone or "none",
             "ccm": self.corrector.ccm.tolist(),
             "ccm_applied": not self.corrector.is_identity,
             "color_space": "sRGB",

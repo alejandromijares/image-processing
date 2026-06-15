@@ -31,7 +31,7 @@ Writer split, because no single library does it all cleanly:
 import os
 import time
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Sequence, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from PIL import Image, ImageCms
@@ -344,18 +344,101 @@ def compute_raw_wb_multipliers(
 # Encode helpers
 # ---------------------------------------------------------------------------
 
-def _encode_srgb(linear_rgb: np.ndarray, bits: int) -> np.ndarray:
-    """Linear float RGB -> sRGB-gamma integer array at the given bit depth."""
-    srgb = linear_to_srgb(linear_rgb)
+# ---------------------------------------------------------------------------
+# Delivery tone curves (the "look", layered on top of the accurate render)
+# ---------------------------------------------------------------------------
+# The CCM + exposure produce colour-accurate, colorimetric output: a mid-grey
+# card lands on its true sRGB value (~160). Developers like Capture One instead
+# apply a default tone curve that lifts the midtones well above that for a
+# brighter, punchier delivery look. These optional curves reproduce that as a
+# choice on top of the accurate render - the CCM (hue) is untouched; only
+# lightness/contrast changes. Anchors are sRGB 0-255 (accurate input -> look
+# output), read off the ColorChecker neutral row (our accurate export vs a
+# Capture One export of the same frame): "bright" matches Capture One, "medium"
+# is roughly half that lift. Endpoints are pinned so black stays black, white
+# white. ``none`` (the default) is the identity - pure colorimetric output.
+TONE_OPTIONS: Tuple[str, ...] = ("none", "medium", "bright")
+_TONE_CURVES: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {
+    "bright": ([0, 52, 85, 122, 160, 200, 243, 255],
+               [0, 48, 105, 160, 200, 224, 240, 255]),
+    "medium": ([0, 52, 85, 122, 160, 200, 243, 255],
+               [0, 50,  95, 141, 180, 212, 242, 255]),
+}
+_TONE_LUT_SIZE = 4096
+_TONE_LUT_CACHE: Dict[str, np.ndarray] = {}
+
+
+def _monotone_cubic_lut(x: np.ndarray, y: np.ndarray, size: int) -> np.ndarray:
+    """Fritsch-Carlson monotone cubic Hermite through (x, y) (both in [0,1]),
+    sampled into a ``size``-entry LUT over [0,1]. Monotone => no tonal overshoot
+    or inversion; smooth => none of the piecewise-linear 'mach band' kinks a
+    straight interpolation would leave in a gradient (e.g. a seamless backdrop)."""
+    h = np.diff(x)
+    delta = np.diff(y) / h
+    m = np.empty_like(y)
+    m[1:-1] = (delta[:-1] + delta[1:]) / 2.0
+    m[0], m[-1] = delta[0], delta[-1]
+    for i in range(delta.size):
+        if delta[i] == 0.0:
+            m[i] = m[i + 1] = 0.0
+        else:
+            a, b = m[i] / delta[i], m[i + 1] / delta[i]
+            t = a * a + b * b
+            if t > 9.0:
+                tau = 3.0 / np.sqrt(t)
+                m[i], m[i + 1] = tau * a * delta[i], tau * b * delta[i]
+    grid = np.linspace(0.0, 1.0, size)
+    idx = np.clip(np.searchsorted(x, grid) - 1, 0, x.size - 2)
+    dx = x[idx + 1] - x[idx]
+    t = (grid - x[idx]) / dx
+    t2, t3 = t * t, t * t * t
+    lut = (
+        (2 * t3 - 3 * t2 + 1) * y[idx]
+        + (t3 - 2 * t2 + t) * dx * m[idx]
+        + (-2 * t3 + 3 * t2) * y[idx + 1]
+        + (t3 - t2) * dx * m[idx + 1]
+    )
+    return np.clip(lut, 0.0, 1.0).astype(np.float32)
+
+
+def _tone_lut(tone: str) -> np.ndarray:
+    if tone not in _TONE_LUT_CACHE:
+        xs, ys = _TONE_CURVES[tone]
+        _TONE_LUT_CACHE[tone] = _monotone_cubic_lut(
+            np.asarray(xs, dtype=np.float64) / 255.0,
+            np.asarray(ys, dtype=np.float64) / 255.0,
+            _TONE_LUT_SIZE,
+        )
+    return _TONE_LUT_CACHE[tone]
+
+
+def apply_tone_curve(srgb01: np.ndarray, tone: Optional[str]) -> np.ndarray:
+    """Map gamma-encoded sRGB in [0,1] through a delivery tone curve.
+    ``None``/``"none"`` is the identity (colour-accurate, colorimetric output)."""
+    if not tone or tone == "none":
+        return srgb01
+    if tone not in _TONE_CURVES:
+        raise ValueError(f"unknown tone {tone!r}; valid: {', '.join(TONE_OPTIONS)}")
+    lut = _tone_lut(tone)
+    grid = np.linspace(0.0, 1.0, lut.size, dtype=np.float32)
+    return np.interp(np.clip(srgb01, 0.0, 1.0), grid, lut).astype(np.float32)
+
+
+def _encode_srgb(linear_rgb: np.ndarray, bits: int, tone: Optional[str] = None) -> np.ndarray:
+    """Linear float RGB -> sRGB-gamma integer array at the given bit depth,
+    optionally through a delivery ``tone`` curve (applied in sRGB space)."""
+    srgb = apply_tone_curve(linear_to_srgb(linear_rgb), tone)
     if bits == 16:
         return np.rint(srgb * 65535.0).clip(0, 65535).astype(np.uint16)
     return np.rint(srgb * 255.0).clip(0, 255).astype(np.uint8)
 
 
-def _write_one(linear_rgb: np.ndarray, dest: str, fmt: str, quality: int) -> str:
+def _write_one(
+    linear_rgb: np.ndarray, dest: str, fmt: str, quality: int, tone: Optional[str] = None
+) -> str:
     spec = EXPORT_FORMATS[fmt]
     bits = int(spec["bits"])
-    data = _encode_srgb(linear_rgb, bits)
+    data = _encode_srgb(linear_rgb, bits, tone)
     icc = _srgb_icc_bytes()
 
     if fmt == "tiff16":
@@ -399,10 +482,12 @@ def export_renditions(
     formats: Sequence[str],
     *,
     quality: int = 95,
+    tone: Optional[str] = None,
 ) -> Dict[str, str]:
     """
     Write ``linear_rgb`` (linear float RGB) to ``out_dir/<stem><suffix>`` for
-    each requested format. Returns {format_key: written_path}.
+    each requested format. Returns {format_key: written_path}. ``tone`` applies
+    an optional delivery tone curve (see ``apply_tone_curve``) to every export.
     """
     unknown = [f for f in formats if f not in EXPORT_FORMATS]
     if unknown:
@@ -414,11 +499,14 @@ def export_renditions(
     for fmt in formats:
         dest = os.path.join(out_dir, stem + str(EXPORT_FORMATS[fmt]["suffix"]))
         with log_duration(LOGGER, f"export {fmt} -> {os.path.basename(dest)}"):
-            written[fmt] = _write_one(linear_rgb, dest, fmt, quality)
+            written[fmt] = _write_one(linear_rgb, dest, fmt, quality, tone)
     return written
 
 
-def linear_to_jpeg_base64(linear_rgb: np.ndarray, max_dim: int = 1024, quality: int = 90) -> str:
+def linear_to_jpeg_base64(
+    linear_rgb: np.ndarray, max_dim: int = 1024, quality: int = 90,
+    tone: Optional[str] = None,
+) -> str:
     """
     Small sRGB JPEG preview (base64) for the control tab / DoCommand response -
     downsized so we never push a full-res still back over gRPC.
@@ -435,7 +523,7 @@ def linear_to_jpeg_base64(linear_rgb: np.ndarray, max_dim: int = 1024, quality: 
         stride = max(1, max(h, w) // (2 * max_dim))
         if stride > 1:
             linear_rgb = linear_rgb[::stride, ::stride]
-        rgb8 = _encode_srgb(linear_rgb, 8)
+        rgb8 = _encode_srgb(linear_rgb, 8, tone)
         img = Image.fromarray(rgb8)
         img.thumbnail((max_dim, max_dim))
         buf = BytesIO()

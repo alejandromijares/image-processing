@@ -9,8 +9,11 @@ from PIL import Image
 
 from models.image_io import (
     EXPORT_FORMATS,
+    TONE_OPTIONS,
+    _TONE_CURVES,
     _encode_srgb,
     _rawpy_wb_kwargs,
+    apply_tone_curve,
     export_renditions,
     is_raw,
     linear_to_jpeg_base64,
@@ -236,3 +239,55 @@ def test_load_linear_rgb_half_size_passthrough(tmp_path, monkeypatch):
 
     load_linear_rgb(str(raw_path))
     assert "half_size" not in fake.postprocess_kwargs
+
+
+# ---------------------------------------------------------------------------
+# Delivery tone curves
+# ---------------------------------------------------------------------------
+
+def test_tone_none_is_identity():
+    x = np.linspace(0.0, 1.0, 256, dtype=np.float32)
+    assert np.array_equal(apply_tone_curve(x, "none"), x)
+    assert np.array_equal(apply_tone_curve(x, None), x)
+
+
+def test_tone_curves_pass_through_their_anchors():
+    # The fitted curve must reproduce the measured ColorChecker mapping at the
+    # anchor points (that's what makes "bright" match Capture One).
+    for tone in ("bright", "medium"):
+        xs, ys = _TONE_CURVES[tone]
+        got = apply_tone_curve(np.asarray(xs, np.float32) / 255.0, tone) * 255.0
+        assert np.allclose(got, ys, atol=0.5), (tone, got, ys)
+
+
+def test_tone_curves_are_monotonic_and_lift_midtones():
+    ramp = np.linspace(0.0, 1.0, 4000, dtype=np.float32)
+    for tone in ("bright", "medium"):
+        out = apply_tone_curve(ramp, tone)
+        # Monotone (Fritsch-Carlson) => no tonal inversion / overshoot.
+        assert (np.diff(out) >= -1e-6).all()
+        assert out.min() >= 0.0 and out.max() <= 1.0
+        # Mid-grey is lifted above the colour-accurate value (the whole point).
+        mid = float(apply_tone_curve(np.array([160 / 255.0], np.float32), tone)[0]) * 255.0
+        assert mid > 165
+    # "bright" lifts more than "medium".
+    g = 160 / 255.0
+    assert (apply_tone_curve(np.array([g], np.float32), "bright")[0]
+            > apply_tone_curve(np.array([g], np.float32), "medium")[0])
+
+
+def test_tone_rejects_unknown_name():
+    with pytest.raises(ValueError, match="unknown tone"):
+        apply_tone_curve(np.zeros((2, 2), np.float32), "punchy")
+
+
+def test_export_applies_tone_curve(tmp_path):
+    # A flat mid-grey frame exports brighter under "bright" than under "none".
+    mid = np.full((4, 4, 3), srgb_to_linear(np.float32(160 / 255.0)), dtype=np.float32)
+    none = export_renditions(mid, str(tmp_path / "n"), "g", ["tiff8"], tone="none")
+    bright = export_renditions(mid, str(tmp_path / "b"), "g", ["tiff8"], tone="bright")
+    from PIL import Image as _Image
+    n = np.array(_Image.open(none["tiff8"]))
+    b = np.array(_Image.open(bright["tiff8"]))
+    assert round(float(n.mean())) == 160          # accurate: unchanged
+    assert float(b.mean()) > 195                   # lifted toward Capture One's ~200

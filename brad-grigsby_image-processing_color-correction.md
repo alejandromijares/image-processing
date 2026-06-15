@@ -63,6 +63,7 @@ installs those automatically on Debian/Ubuntu.
 | `jpeg_quality`   | int          | Optional  | JPEG export quality. Default `95`.                                                      |
 | `white_balance`  | string/array | Optional  | RAW white balance: `camera` (default), `auto`, `daylight`, or `[r,g,b,g2]` multipliers. |
 | `exposure_stops` | number       | Optional  | Default exposure compensation (stops) applied at the raw stage. Paste the value `calibrate_color` reports to render captures at the calibrated reference brightness. Default `0`. A per-call `exposure_stops` overrides it. |
+| `tone`           | string       | Optional  | Delivery "look" applied on export: `none` (default — colour-accurate / colorimetric output), `medium`, or `bright` (a Capture One-style midtone lift). Only lightness/contrast changes — the CCM keeps hue accurate. Applied to every export and the preview; recorded in the sidecar. A per-call `tone` overrides it. |
 | `write_sidecar`  | boolean      | Optional  | Write a `<name>.json` sidecar recording the development. Default `true`.                |
 | `part_id`        | string       | Optional  | Machine part to attach `upload`s to. Defaults to `VIAM_MACHINE_PART_ID` from the env.   |
 | `delete_after_upload` | boolean | Optional  | Remove each local file once its `upload` succeeds (failed uploads keep their files for retry). Default `false`. |
@@ -131,8 +132,15 @@ pipeline, and writes the exports + sidecar. Returns a small base64 JPEG
 
 Options (all optional): `capture_options` (forwarded to the source's `capture`),
 `white_balance`, `exposure_stops` (exposure compensation applied at the raw
-stage), `output_formats`, `output_dir`. Each overrides the config default for
-this call.
+stage), `tone` (delivery look: `none`/`medium`/`bright`), `output_formats`,
+`output_dir`. Each overrides the config default for this call.
+
+> **Accurate vs. the Capture One look:** with `tone: none` (default) the pipeline
+> is colorimetric — a mid-grey card lands on its true sRGB value (~160), which
+> looks darker than Capture One because C1 applies a default tone curve that lifts
+> midtones (mid-grey ~200). Set `tone: bright` to reproduce that lift (or `medium`
+> for roughly half). The CCM is untouched, so hue stays accurate — only
+> lightness/contrast changes.
 
 Returns:
 

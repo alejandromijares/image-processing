@@ -298,6 +298,7 @@ def _component(source, output_dir=None):
     cc.corrector = ColorCorrector.identity()
     cc._white_balance = "camera"
     cc._exposure_stops = 0.0
+    cc._tone = "none"
     cc._output_formats = ["tiff16", "jpeg"]
     cc._output_dir = output_dir
     cc._jpeg_quality = 95
@@ -400,6 +401,37 @@ def test_configured_exposure_stops_flows_into_develop(tmp_path, monkeypatch):
 
     asyncio.run(cc.do_command({"develop": {"path": p, "exposure_stops": 0.0}}))
     assert seen["exposure_stops"] == 0.0  # per-call override wins
+
+
+def test_configured_tone_flows_into_export(tmp_path, monkeypatch):
+    """The `tone` config default reaches the export (and sidecar), and a per-call
+    `tone` overrides it."""
+    import json
+
+    import models.color_correction as cc_mod
+
+    cc = _component(_FakeSource(saved_path=None), output_dir=str(tmp_path / "out"))
+    cc._tone = "bright"
+    cc._write_sidecar = True
+
+    seen = {}
+    real = cc_mod.export_renditions
+
+    def spy(*args, **kwargs):
+        seen["tone"] = kwargs.get("tone")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(cc_mod, "export_renditions", spy)
+    p = _write_still(tmp_path)
+
+    out = asyncio.run(cc.do_command({"develop": {"path": p}}))["develop"]
+    assert seen["tone"] == "bright"  # config default applied
+    # ...and recorded in the sidecar for reproducibility.
+    with open(out["sidecar"]) as f:
+        assert json.load(f)["tone"] == "bright"
+
+    asyncio.run(cc.do_command({"develop": {"path": p, "tone": "none"}}))
+    assert seen["tone"] == "none"  # per-call override wins
 
 
 # ---------------------------------------------------------------------------
