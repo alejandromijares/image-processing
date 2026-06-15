@@ -1611,8 +1611,8 @@ class ColorCorrection(Camera, EasyResource):
                     timeout=self._upload_file_timeout_s,
                 )
                 self.logger.info(
-                    f"[timing] upload {os.path.basename(path)} "
-                    f"({size / 1e6:.1f} MB): {time.perf_counter() - t_upload:.2f}s"
+                    f"[timing] uploaded {os.path.basename(path)} "
+                    f"({size / 1e6:.1f} MB) in {time.perf_counter() - t_upload:.2f}s"
                 )
                 uploaded.append(path)
             except asyncio.TimeoutError:
