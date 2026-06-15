@@ -197,8 +197,8 @@ def load_linear_rgb(
         )
         kwargs.update(_rawpy_wb_kwargs(white_balance))
         if exposure_stops:
-            # exp_shift is a linear multiplier; libraw clamps it to [0.25, 8].
-            kwargs["exp_correc"] = True
+            # exp_shift is a linear multiplier (rawpy enables the exposure
+            # correction automatically when it's set); libraw clamps it to [0.25, 8].
             kwargs["exp_shift"] = float(np.clip(2.0 ** exposure_stops, 0.25, 8.0))
         if user_flip is not None:
             kwargs["user_flip"] = int(user_flip)
