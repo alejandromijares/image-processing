@@ -770,6 +770,20 @@ class ColorCorrection(Camera, EasyResource):
         )
         self._data_client: Optional[DataClient] = None
 
+        # Bound the cloud round-trips so a stuck auth dial or a stalled file
+        # transfer surfaces as a clear error / per-file failure (the file is
+        # kept for retry) instead of hanging the submit forever. Timeouts are
+        # per-file, not per-batch, so a large shoot never trips a single global
+        # deadline. The dial only happens on the first upload, which is the
+        # usual place a submit silently wedges when the machine can't reach the
+        # cloud.
+        self._upload_dial_timeout_s: float = float(
+            attrs.get("upload_dial_timeout_s", 30.0)
+        )
+        self._upload_file_timeout_s: float = float(
+            attrs.get("upload_file_timeout_s", 180.0)
+        )
+
         # In-flight deferred captures (`capture` with `defer: true`), keyed by
         # the capture_id handed back to the caller. Preserved across
         # reconfigure so a mid-sequence config change doesn't orphan results.
@@ -1516,7 +1530,25 @@ class ColorCorrection(Camera, EasyResource):
             credentials=Credentials(type="api-key", payload=api_key),
             auth_entity=api_key_id,
         )
-        channel = await _dial_app("app.viam.com", dial_options)
+        self.logger.info(
+            "`upload` authenticating to app.viam.com "
+            f"(dial timeout {self._upload_dial_timeout_s:.0f}s)"
+        )
+        t_dial = time.perf_counter()
+        try:
+            channel = await asyncio.wait_for(
+                _dial_app("app.viam.com", dial_options),
+                timeout=self._upload_dial_timeout_s,
+            )
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(
+                f"`upload` timed out after {self._upload_dial_timeout_s:.0f}s "
+                "dialing app.viam.com to authenticate — the machine may be "
+                "offline or unable to reach the cloud."
+            ) from exc
+        self.logger.info(
+            f"`upload` authenticated in {time.perf_counter() - t_dial:.2f}s"
+        )
         metadata = getattr(channel, "_metadata", {})
         self._data_client = DataClient(channel, metadata)
         return self._data_client
@@ -1560,22 +1592,38 @@ class ColorCorrection(Camera, EasyResource):
         uploaded: List[str] = []
         failed: List[Dict[str, str]] = []
         deleted: List[str] = []
-        for path in paths:
+        for i, path in enumerate(paths):
             try:
                 size = os.path.getsize(path)
-                t_upload = time.perf_counter()
-                await self._file_upload_chunked(
-                    data_client,
-                    path,
-                    part_id=str(part_id),
-                    component_name=str(component_name),
-                    tags=tags or None,
+                self.logger.info(
+                    f"uploading {os.path.basename(path)} ({size / 1e6:.1f} MB) "
+                    f"[{i + 1}/{len(paths)}] (timeout {self._upload_file_timeout_s:.0f}s)"
                 )
-                self.logger.debug(
+                t_upload = time.perf_counter()
+                await asyncio.wait_for(
+                    self._file_upload_chunked(
+                        data_client,
+                        path,
+                        part_id=str(part_id),
+                        component_name=str(component_name),
+                        tags=tags or None,
+                    ),
+                    timeout=self._upload_file_timeout_s,
+                )
+                self.logger.info(
                     f"[timing] upload {os.path.basename(path)} "
                     f"({size / 1e6:.1f} MB): {time.perf_counter() - t_upload:.2f}s"
                 )
                 uploaded.append(path)
+            except asyncio.TimeoutError:
+                # File kept for retry — a per-file deadline means one stalled
+                # transfer can't wedge the whole submit.
+                msg = (
+                    f"upload timed out after {self._upload_file_timeout_s:.0f}s"
+                )
+                self.logger.error(f"failed to upload {path}: {msg}")
+                failed.append({"path": path, "error": msg})
+                continue
             except Exception as exc:  # noqa: BLE001 - report per-file, keep going
                 self.logger.error(f"failed to upload {path}: {exc}")
                 failed.append({"path": path, "error": str(exc)})

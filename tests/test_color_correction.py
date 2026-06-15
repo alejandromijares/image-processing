@@ -306,6 +306,8 @@ def _component(source, output_dir=None):
     cc._part_id = None
     cc._data_client = None
     cc._delete_after_upload = False
+    cc._upload_dial_timeout_s = 30.0
+    cc._upload_file_timeout_s = 180.0
     cc._pending_captures = {}
     cc._capture_seq = 0
     return cc
