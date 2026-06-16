@@ -207,7 +207,7 @@ def test_trigger_returns_camera_path_without_download():
 
 
 # ---------------------------------------------------------------------------
-# focus_config(): walks the camera's config tree for focus discovery, with an
+# list_widgets(): walks the camera's config tree for focus discovery, with an
 # opt-in live-view toggle that exposes the step-drive widgets
 # ---------------------------------------------------------------------------
 
@@ -314,7 +314,7 @@ def _root(children):
     return _FakeWidget("main", gp.GP_WIDGET_WINDOW, children=children)
 
 
-def test_focus_config_reports_all_widgets_with_focus_flag():
+def test_list_widgets_reports_all_widgets_with_focus_flag():
     tree = _root([
         _FakeWidget("capture", gp.GP_WIDGET_SECTION, children=[
             _radio("manualfocusdrive", ["None", "Near 1", "Far 1"], "None"),
@@ -327,7 +327,7 @@ def test_focus_config_reports_all_widgets_with_focus_flag():
     ])
     session = _session_with_cam(_FakeCamForConfig([tree]))
 
-    widgets = session.focus_config()
+    widgets = session.list_widgets()
     by_name = {w["name"]: w for w in widgets}
 
     # Every leaf is reported - sections/windows are not, but iso is.
@@ -347,20 +347,20 @@ def test_focus_config_reports_all_widgets_with_focus_flag():
     assert by_name["lightmeter"]["range"] == {"min": -3.0, "max": 3.0, "step": 0.5}
 
 
-def test_focus_config_skips_unreadable_widget():
+def test_list_widgets_skips_unreadable_widget():
     tree = _root([
         _radio("focusmode", ["One Shot", "Manual"], "Manual"),
         _FakeWidget("brokenfocus", gp.GP_WIDGET_TEXT, raises=True),
     ])
     session = _session_with_cam(_FakeCamForConfig([tree]))
 
-    widgets = session.focus_config()
+    widgets = session.list_widgets()
     names = {w["name"] for w in widgets}
 
     assert names == {"focusmode"}  # the raising widget is skipped, not fatal
 
 
-def test_focus_config_live_view_toggles_and_restores(monkeypatch):
+def test_list_widgets_live_view_toggles_and_restores(monkeypatch):
     monkeypatch.setattr("models.ptp._LIVE_VIEW_SETTLE_SEC", 0.0)
     # The viewfinder widget is shared across trees so its set_value history
     # captures both the toggle-on and the restore.
@@ -374,7 +374,7 @@ def test_focus_config_live_view_toggles_and_restores(monkeypatch):
     cam = _FakeCamForConfig([before, after, after])
     session = _session_with_cam(cam)
 
-    widgets = session.focus_config(live_view=True)
+    widgets = session.list_widgets(live_view=True)
     names = {w["name"] for w in widgets}
 
     # Re-fetch happened: manualfocusdrive only exists in the post-toggle tree.
@@ -385,7 +385,7 @@ def test_focus_config_live_view_toggles_and_restores(monkeypatch):
     assert cam.get_config_calls == 3  # initial, re-fetch, restore
 
 
-def test_focus_config_restore_is_best_effort(monkeypatch):
+def test_list_widgets_restore_is_best_effort(monkeypatch):
     monkeypatch.setattr("models.ptp._LIVE_VIEW_SETTLE_SEC", 0.0)
     vf = _FakeWidget("eosviewfinder", gp.GP_WIDGET_TOGGLE, value=0)
     before = _root([vf])
@@ -394,7 +394,7 @@ def test_focus_config_restore_is_best_effort(monkeypatch):
     cam = _FakeCamForConfig([before, after, after], fail_set_config={2})
     session = _session_with_cam(cam)
 
-    widgets = session.focus_config(live_view=True)
+    widgets = session.list_widgets(live_view=True)
     names = {w["name"] for w in widgets}
 
     # The discovery result still comes back; the restore failure is swallowed
@@ -403,24 +403,24 @@ def test_focus_config_restore_is_best_effort(monkeypatch):
     assert session.reconnected is False
 
 
-def test_do_command_focus_config():
-    class _FocusConfigSession:
+def test_do_command_list_widgets():
+    class _ListWidgetsSession:
         def __init__(self, widgets):
             self._widgets = widgets
             self.calls = []
 
-        def focus_config(self, live_view=False):
+        def list_widgets(self, live_view=False):
             self.calls.append(live_view)
             return self._widgets
 
-    session = _FocusConfigSession([
+    session = _ListWidgetsSession([
         {"name": "manualfocusdrive", "focus_relevant": True, "value": (1, 2)},
         {"name": "iso", "focus_relevant": False, "value": "100"},
     ])
     ptp = _ptp_component(session)
 
-    resp = asyncio.run(ptp.do_command({"focus_config": {"live_view": True}}))
-    out = resp["focus_config"]
+    resp = asyncio.run(ptp.do_command({"list_widgets": {"live_view": True}}))
+    out = resp["list_widgets"]
 
     assert out["count"] == 2
     assert out["focus_count"] == 1

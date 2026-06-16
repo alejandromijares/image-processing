@@ -60,8 +60,8 @@ Two ways to get images out:
        {"summary": {}}
            -> camera model, port, and the libgphoto2 capability summary.
 
-       {"focus_config": {}}
-       {"focus_config": {"live_view": true}}
+       {"list_widgets": {}}
+       {"list_widgets": {"live_view": true}}
            -> focus-discovery diagnostic: report every config widget the body
               exposes (name, label, type, current value, choices/range, and a
               `focus_relevant` flag), as {"widgets", "count", "focus_count"}.
@@ -372,7 +372,7 @@ class PTPSession:
     # re-running the whole method after a reconnect leaves no net state change -
     # it's effectively idempotent.
     @_retry_once_on_device_gone
-    def focus_config(self, live_view: bool = False) -> List[Dict[str, Any]]:
+    def list_widgets(self, live_view: bool = False) -> List[Dict[str, Any]]:
         """Walk the camera's config tree and report every leaf widget.
 
         A focus-discovery diagnostic: which focus approach (absolute distance,
@@ -781,8 +781,8 @@ class PTP(Camera, EasyResource):
         if "summary" in command:
             resp["summary"] = await self._summary()
 
-        if "focus_config" in command:
-            resp["focus_config"] = await self._focus_config(command.get("focus_config") or {})
+        if "list_widgets" in command:
+            resp["list_widgets"] = await self._list_widgets(command.get("list_widgets") or {})
 
         if "list_files" in command:
             resp["list_files"] = await self._list_files(command.get("list_files") or {})
@@ -804,7 +804,7 @@ class PTP(Camera, EasyResource):
 
         if not resp:
             raise ValueError(
-                "no recognized command; supported: summary, focus_config, "
+                "no recognized command; supported: summary, list_widgets, "
                 "list_files, capture, trigger, download, download_all, delete"
             )
         return resp
@@ -821,7 +821,7 @@ class PTP(Camera, EasyResource):
             "summary": text,
         }
 
-    async def _focus_config(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
+    async def _list_widgets(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
         """Report the body's config widgets for focus discovery.
 
         ``{"live_view": true}`` briefly enables the EOS viewfinder first so the
@@ -829,7 +829,7 @@ class PTP(Camera, EasyResource):
         is purely read-only.
         """
         live_view = bool(opts.get("live_view", False))
-        widgets = await self._run(self._session.focus_config, live_view)
+        widgets = await self._run(self._session.list_widgets, live_view)
         safe = [self._coerce_widget(w) for w in widgets]
         return {
             "widgets": safe,
