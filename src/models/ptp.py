@@ -59,6 +59,16 @@ Two ways to get images out:
 
        {"summary": {}}
            -> camera model, port, and the libgphoto2 capability summary.
+
+       {"list_widgets": {}}
+       {"list_widgets": {"live_view": true}}
+           -> focus-discovery diagnostic: report every config widget the body
+              exposes (name, label, type, current value, choices/range, and a
+              `focus_relevant` flag), as {"widgets", "count", "focus_count"}.
+              Use it to learn which focus approach this body supports. With
+              `live_view: true` it briefly enables the EOS viewfinder so the
+              step-drive widgets (`manualfocusdrive`/`autofocusdrive`) become
+              visible, then restores it; default is read-only.
 """
 
 import asyncio
@@ -121,6 +131,67 @@ def _mime_for(name: str) -> str:
     # RAW and anything unknown is opaque to us; label it generically so callers
     # know it's bytes-on-the-wire, not a previewable JPEG.
     return _EXT_TO_MIME.get(ext, "application/octet-stream")
+
+
+# Config widgets that matter for focus control but whose names don't contain
+# "focus", so a substring filter would hide them. `eosremoterelease` is the
+# Press Half/Full widget (the basis of trigger-AF-then-lock); live view must be
+# on to operate `manualfocusdrive`/`autofocusdrive`; `eoszoom` is for fine MF
+# checking; `afmethod`/`eosafmode` describe the AF area mode.
+_FOCUS_RELEVANT_WIDGETS = (
+    "viewfinder",
+    "eosviewfinder",
+    "eoszoom",
+    "eoszoomposition",
+    "eosremoterelease",
+    "afmethod",
+    "eosafmethod",
+    "eosafmode",
+    "cancelautofocus",
+)
+
+# Seconds to wait after enabling live view before re-reading the config tree.
+# The mirror flips and the live-view subsystem spins up over a fraction of a
+# second; an instantaneous re-read can still miss the step-drive widgets
+# (manualfocusdrive/autofocusdrive). TUNE ON THE BENCH - this is hardware
+# timing we can't verify without the body.
+_LIVE_VIEW_SETTLE_SEC = 0.75
+
+# Built lazily because `gp` is None when the gphoto2 wheel is missing (see the
+# import guard above), so we can't reference gp.GP_WIDGET_* at module load.
+_WIDGET_TYPE_NAMES: Optional[Dict[int, str]] = None
+
+
+def _widget_type_name(widget_type: int) -> str:
+    """Readable name for a libgphoto2 ``GP_WIDGET_*`` type constant."""
+    global _WIDGET_TYPE_NAMES
+    if _WIDGET_TYPE_NAMES is None:
+        if gp is None:
+            return str(widget_type)
+        _WIDGET_TYPE_NAMES = {
+            gp.GP_WIDGET_WINDOW: "window",
+            gp.GP_WIDGET_SECTION: "section",
+            gp.GP_WIDGET_TEXT: "text",
+            gp.GP_WIDGET_RANGE: "range",
+            gp.GP_WIDGET_TOGGLE: "toggle",
+            gp.GP_WIDGET_RADIO: "radio",
+            gp.GP_WIDGET_MENU: "menu",
+            gp.GP_WIDGET_BUTTON: "button",
+            gp.GP_WIDGET_DATE: "date",
+        }
+    return _WIDGET_TYPE_NAMES.get(widget_type, str(widget_type))
+
+
+def _is_focus_relevant(name: str, label: str) -> bool:
+    """True if a widget is worth highlighting for focus discovery.
+
+    Used only to set a per-widget flag in the report - never to filter, since
+    the whole point of discovery is to see the full tree (some focus controls,
+    e.g. `eosremoterelease`, carry no "focus" in their name or label).
+    """
+    if "focus" in name.lower() or "focus" in label.lower():
+        return True
+    return name in _FOCUS_RELEVANT_WIDGETS
 
 
 def _device_gone(exc: Exception) -> bool:
@@ -295,6 +366,105 @@ class PTPSession:
     @_retry_once_on_device_gone
     def summary(self) -> str:
         return str(self._cam.get_summary().text)
+
+    # Safe under @_retry_once_on_device_gone despite the live-view write: the
+    # toggle is restored to its original value in a best-effort `finally`, so
+    # re-running the whole method after a reconnect leaves no net state change -
+    # it's effectively idempotent.
+    @_retry_once_on_device_gone
+    def list_widgets(self, live_view: bool = False) -> List[Dict[str, Any]]:
+        """Walk the camera's config tree and report every leaf widget.
+
+        A focus-discovery diagnostic: which focus approach (absolute distance,
+        relative step-drive, or trigger-AF-then-lock) is even possible depends
+        entirely on what config widgets this specific body exposes, which we can
+        only learn from the real hardware. We return *every* leaf widget (each
+        flagged with ``focus_relevant``) rather than filtering, because some
+        focus controls carry no "focus" in their name (e.g. ``eosremoterelease``).
+
+        When ``live_view`` is True we briefly enable the EOS viewfinder before
+        walking: on Canon bodies the step-drive widgets (``manualfocusdrive`` /
+        ``autofocusdrive``) only materialize in the tree once live view is
+        active. The original viewfinder value is restored afterward.
+        """
+        cam = self._cam
+        config = cam.get_config()
+
+        restore_viewfinder = None  # (widget_name, original_value) if we toggled
+        if live_view:
+            for vf_name in ("eosviewfinder", "viewfinder"):
+                try:
+                    vf = config.get_child_by_name(vf_name)
+                except gp.GPhoto2Error:
+                    continue  # this body doesn't expose that widget; try the next
+                try:
+                    original = vf.get_value()
+                    vf.set_value(1)
+                    cam.set_config(config)
+                    restore_viewfinder = (vf_name, original)
+                    # Let the live-view subsystem spin up before re-reading, or
+                    # the step-drive widgets may not be in the tree yet.
+                    time.sleep(_LIVE_VIEW_SETTLE_SEC)
+                    config = cam.get_config()
+                except gp.GPhoto2Error as exc:
+                    LOGGER.warning(
+                        f"could not enable live view ({vf_name}) for focus "
+                        f"discovery ({exc}); reporting widgets as-is"
+                    )
+                break
+
+        try:
+            widgets: List[Dict[str, Any]] = []
+            self._collect_widgets(config, widgets)
+            return widgets
+        finally:
+            # Best-effort restore: the likely reason we'd be unwinding here is a
+            # vanished device, in which case this set_config also fails - and an
+            # unguarded raise from `finally` would mask the original error and
+            # pre-empt the device-gone retry. Swallow it (cf. capturetarget).
+            if restore_viewfinder is not None:
+                vf_name, original = restore_viewfinder
+                try:
+                    restore_config = cam.get_config()
+                    restore_config.get_child_by_name(vf_name).set_value(original)
+                    cam.set_config(restore_config)
+                except gp.GPhoto2Error as exc:
+                    LOGGER.debug(f"could not restore {vf_name} after discovery: {exc}")
+
+    def _collect_widgets(self, widget, out: List[Dict[str, Any]]) -> None:
+        """Recursively flatten a libgphoto2 config tree into ``out``.
+
+        Sections/windows are pure containers - recurse into them but don't emit
+        them. Every other (leaf) widget is described; a single malformed widget
+        is logged and skipped rather than aborting the whole scan.
+        """
+        wtype = widget.get_type()
+        if wtype in (gp.GP_WIDGET_WINDOW, gp.GP_WIDGET_SECTION):
+            for child in widget.get_children():
+                self._collect_widgets(child, out)
+            return
+
+        try:
+            name = widget.get_name()
+            label = widget.get_label()
+            entry: Dict[str, Any] = {
+                "name": name,
+                "label": label,
+                "type": _widget_type_name(wtype),
+                "readonly": bool(widget.get_readonly()),
+                "value": widget.get_value(),
+                "focus_relevant": _is_focus_relevant(name, label),
+            }
+            if wtype in (gp.GP_WIDGET_RADIO, gp.GP_WIDGET_MENU):
+                entry["choices"] = [
+                    widget.get_choice(i) for i in range(widget.count_choices())
+                ]
+            elif wtype == gp.GP_WIDGET_RANGE:
+                lo, hi, step = widget.get_range()
+                entry["range"] = {"min": lo, "max": hi, "step": step}
+            out.append(entry)
+        except gp.GPhoto2Error as exc:
+            LOGGER.debug(f"skipping unreadable config widget: {exc}")
 
     def refresh(self) -> None:
         """Drop libgphoto2's cached filesystem so the next read re-scans the card.
@@ -611,6 +781,9 @@ class PTP(Camera, EasyResource):
         if "summary" in command:
             resp["summary"] = await self._summary()
 
+        if "list_widgets" in command:
+            resp["list_widgets"] = await self._list_widgets(command.get("list_widgets") or {})
+
         if "list_files" in command:
             resp["list_files"] = await self._list_files(command.get("list_files") or {})
 
@@ -631,8 +804,8 @@ class PTP(Camera, EasyResource):
 
         if not resp:
             raise ValueError(
-                "no recognized command; supported: summary, list_files, "
-                "capture, trigger, download, download_all, delete"
+                "no recognized command; supported: summary, list_widgets, "
+                "list_files, capture, trigger, download, download_all, delete"
             )
         return resp
 
@@ -647,6 +820,41 @@ class PTP(Camera, EasyResource):
             "port": self._session.port_path,
             "summary": text,
         }
+
+    async def _list_widgets(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
+        """Report the body's config widgets for focus discovery.
+
+        ``{"live_view": true}`` briefly enables the EOS viewfinder first so the
+        step-drive widgets become visible (and restores it afterward). Default
+        is purely read-only.
+        """
+        live_view = bool(opts.get("live_view", False))
+        widgets = await self._run(self._session.list_widgets, live_view)
+        safe = [self._coerce_widget(w) for w in widgets]
+        return {
+            "widgets": safe,
+            "count": len(safe),
+            "focus_count": sum(1 for w in safe if w.get("focus_relevant")),
+        }
+
+    @staticmethod
+    def _coerce_widget(widget: Dict[str, Any]) -> Dict[str, ValueTypes]:
+        """Coerce a widget dict to gRPC-safe primitives (str/number/bool/list/dict).
+
+        Widget values are almost always str/int/float/bool already, but a widget
+        value of an unexpected type would not survive the struct conversion, so
+        cast anything outside those to ``str``.
+        """
+        def _safe(v: Any) -> ValueTypes:
+            if isinstance(v, (str, int, float, bool)) or v is None:
+                return v
+            if isinstance(v, dict):
+                return {k: _safe(x) for k, x in v.items()}
+            if isinstance(v, (list, tuple)):
+                return [_safe(x) for x in v]
+            return str(v)
+
+        return {k: _safe(v) for k, v in widget.items()}
 
     async def _list_files(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
         files = await self._run(self._session.list_image_files)
