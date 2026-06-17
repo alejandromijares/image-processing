@@ -207,6 +207,54 @@ def test_trigger_returns_camera_path_without_download():
 
 
 # ---------------------------------------------------------------------------
+# cleanup(): clears the local download_dir without touching the camera card
+# ---------------------------------------------------------------------------
+
+def test_cleanup_removes_files_in_download_dir(tmp_path):
+    (tmp_path / "IMG_0001.CR3").write_bytes(b"a")
+    (tmp_path / "IMG_0002.JPG").write_bytes(b"b")
+    sub = tmp_path / "subdir"
+    sub.mkdir()
+    (sub / "nested.JPG").write_bytes(b"c")  # subdirectory is left alone
+
+    ptp = _ptp_component(_TriggerOnlySession())
+    ptp._download_dir = str(tmp_path)
+
+    resp = asyncio.run(ptp.do_command({"cleanup": {}}))
+
+    out = resp["cleanup"]
+    assert out["count"] == 2
+    assert set(out["removed"]) == {"IMG_0001.CR3", "IMG_0002.JPG"}
+    assert out["dry_run"] is False
+    assert not (tmp_path / "IMG_0001.CR3").exists()
+    assert not (tmp_path / "IMG_0002.JPG").exists()
+    assert (sub / "nested.JPG").exists()  # subdir contents untouched
+
+
+def test_cleanup_dry_run_reports_without_deleting(tmp_path):
+    (tmp_path / "IMG_0001.CR3").write_bytes(b"a")
+
+    ptp = _ptp_component(_TriggerOnlySession())
+    ptp._download_dir = str(tmp_path)
+
+    resp = asyncio.run(ptp.do_command({"cleanup": {"dry_run": True}}))
+
+    out = resp["cleanup"]
+    assert out["count"] == 1
+    assert out["removed"] == ["IMG_0001.CR3"]
+    assert out["dry_run"] is True
+    assert (tmp_path / "IMG_0001.CR3").exists()  # nothing actually deleted
+
+
+def test_cleanup_requires_download_dir():
+    ptp = _ptp_component(_TriggerOnlySession())
+    ptp._download_dir = None
+
+    with pytest.raises(ValueError, match="download_dir"):
+        asyncio.run(ptp.do_command({"cleanup": {}}))
+
+
+# ---------------------------------------------------------------------------
 # list_widgets(): walks the camera's config tree for focus discovery, with an
 # opt-in live-view toggle that exposes the step-drive widgets
 # ---------------------------------------------------------------------------

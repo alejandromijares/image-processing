@@ -57,6 +57,13 @@ Two ways to get images out:
            -> delete a file from the camera (only do this after a successful
               download; with `delete_after_download` it happens automatically).
 
+       {"cleanup": {}}
+       {"cleanup": {"dry_run": true}}
+           -> remove the downloaded files from the local `download_dir` to
+              reclaim disk (the on-camera card is left untouched; use `delete`
+              for that). Returns {"directory", "removed", "count", "dry_run"};
+              `dry_run` reports what would be removed without deleting.
+
        {"summary": {}}
            -> camera model, port, and the libgphoto2 capability summary.
 
@@ -802,10 +809,14 @@ class PTP(Camera, EasyResource):
         if "delete" in command:
             resp["delete"] = await self._delete(command.get("delete") or {})
 
+        if "cleanup" in command:
+            resp["cleanup"] = await self._cleanup(command.get("cleanup") or {})
+
         if not resp:
             raise ValueError(
                 "no recognized command; supported: summary, list_widgets, "
-                "list_files, capture, trigger, download, download_all, delete"
+                "list_files, capture, trigger, download, download_all, delete, "
+                "cleanup"
             )
         return resp
 
@@ -963,6 +974,41 @@ class PTP(Camera, EasyResource):
         await self._run(self._session.delete, str(path))
         self._downloaded.discard(str(path))
         return {"deleted": str(path)}
+
+    async def _cleanup(self, opts: Mapping[str, Any]) -> Mapping[str, ValueTypes]:
+        """
+        Remove downloaded files from the local `download_dir` to reclaim disk -
+        the on-camera card is untouched (use `delete` for that). Only files
+        directly in the directory are considered; subdirectories are skipped.
+
+        Options:
+          `dry_run: true` -> report what would be removed without deleting.
+        """
+        if not self._download_dir:
+            raise ValueError("`cleanup` requires a `download_dir` to be configured")
+
+        dry_run = bool(opts.get("dry_run", False))
+
+        def _scan_and_remove() -> List[str]:
+            removed: List[str] = []
+            for name in os.listdir(self._download_dir):
+                full = os.path.join(self._download_dir, name)
+                if not os.path.isfile(full):
+                    continue
+                if not dry_run:
+                    os.remove(full)
+                removed.append(name)
+            return removed
+
+        removed = await asyncio.get_running_loop().run_in_executor(None, _scan_and_remove)
+        verb = "would remove" if dry_run else "removed"
+        self.logger.info(f"cleanup: {verb} {len(removed)} file(s) from {self._download_dir}")
+        return {
+            "directory": self._download_dir,
+            "removed": removed,
+            "count": len(removed),
+            "dry_run": dry_run,
+        }
 
     # ------------------------------------------------------------------
     # Unsupported camera methods
