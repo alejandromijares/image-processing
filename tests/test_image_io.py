@@ -261,29 +261,50 @@ def test_tone_none_is_identity():
     assert np.array_equal(apply_tone_curve(x, None), x)
 
 
+def _gray(values):
+    """Stack scalar/1-D sRGB values into neutral RGB triples - the tone curve
+    now reads luma, so it needs a colour (..., 3) input."""
+    v = np.atleast_1d(np.asarray(values, np.float32))
+    return np.stack([v, v, v], axis=-1)
+
+
 def test_tone_curves_pass_through_their_anchors():
-    # The fitted curve must reproduce the measured ColorChecker mapping at the
-    # anchor points (that's what makes "bright" match Capture One).
-    for tone in ("bright", "medium"):
+    # On a neutral patch the luminance-only curve must reproduce the measured
+    # ColorChecker mapping at the anchor points (that's what makes "c1" match
+    # Capture One); R=G=B in => R=G=B out at the anchor value.
+    for tone in ("c1", "bright", "medium"):
         xs, ys = _TONE_CURVES[tone]
-        got = apply_tone_curve(np.asarray(xs, np.float32) / 255.0, tone) * 255.0
-        assert np.allclose(got, ys, atol=0.5), (tone, got, ys)
+        got = apply_tone_curve(_gray(np.asarray(xs, np.float32) / 255.0), tone) * 255.0
+        assert np.allclose(got[..., 0], ys, atol=0.5), (tone, got[..., 0], ys)
+
+
+def test_tone_curve_preserves_hue():
+    # The whole point of luminance-only application: a saturated colour keeps its
+    # channel ratios (hue/saturation) - only its brightness changes.
+    color = np.array([[0.6, 0.3, 0.15]], np.float32)  # an orange
+    out = apply_tone_curve(color, "c1")[0]
+    ratio_in = color[0] / color[0].max()
+    ratio_out = out / out.max()
+    assert np.allclose(ratio_in, ratio_out, atol=0.02), (ratio_in, ratio_out)
 
 
 def test_tone_curves_are_monotonic_and_lift_midtones():
-    ramp = np.linspace(0.0, 1.0, 4000, dtype=np.float32)
-    for tone in ("bright", "medium"):
-        out = apply_tone_curve(ramp, tone)
+    ramp = _gray(np.linspace(0.0, 1.0, 4000, dtype=np.float32))
+    for tone in ("c1", "bright", "medium"):
+        out = apply_tone_curve(ramp, tone)[..., 0]
         # Monotone (Fritsch-Carlson) => no tonal inversion / overshoot.
         assert (np.diff(out) >= -1e-6).all()
         assert out.min() >= 0.0 and out.max() <= 1.0
         # Mid-grey is lifted above the colour-accurate value (the whole point).
-        mid = float(apply_tone_curve(np.array([160 / 255.0], np.float32), tone)[0]) * 255.0
+        mid = float(apply_tone_curve(_gray(160 / 255.0), tone)[0, 0]) * 255.0
         assert mid > 165
-    # "bright" lifts more than "medium".
-    g = 160 / 255.0
-    assert (apply_tone_curve(np.array([g], np.float32), "bright")[0]
-            > apply_tone_curve(np.array([g], np.float32), "medium")[0])
+    # "bright" lifts more than "medium" at mid-grey.
+    g = _gray(160 / 255.0)
+    assert apply_tone_curve(g, "bright")[0, 0] > apply_tone_curve(g, "medium")[0, 0]
+    # "c1" is an S-curve: it lifts mid-grey (asserted above) but *deepens* the
+    # shadows - a deep shadow comes out darker than it went in.
+    shadow = _gray(53 / 255.0)
+    assert apply_tone_curve(shadow, "c1")[0, 0] < shadow[0, 0]
 
 
 def test_tone_rejects_unknown_name():

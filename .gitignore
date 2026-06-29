@@ -170,6 +170,7 @@ reload-*/
 # One off scripts
 real_testing.py
 debug_calibration.py
+compare_renditions.py
 
 # Images
 *.jpg
@@ -180,3 +181,4 @@ debug_calibration.py
 *.svg
 *.ico
 *.CR3
+*.tif

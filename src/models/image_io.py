@@ -379,14 +379,21 @@ def compute_raw_wb_multipliers(
 # card lands on its true sRGB value (~160). Developers like Capture One instead
 # apply a default tone curve that lifts the midtones well above that for a
 # brighter, punchier delivery look. These optional curves reproduce that as a
-# choice on top of the accurate render - the CCM (hue) is untouched; only
-# lightness/contrast changes. Anchors are sRGB 0-255 (accurate input -> look
-# output), read off the ColorChecker neutral row (our accurate export vs a
-# Capture One export of the same frame): "bright" matches Capture One, "medium"
-# is roughly half that lift. Endpoints are pinned so black stays black, white
-# white. ``none`` (the default) is the identity - pure colorimetric output.
-TONE_OPTIONS: Tuple[str, ...] = ("none", "medium", "bright")
+# choice on top of the accurate render. The curve is applied to *luminance only*
+# (RGB scaled by f(luma)/luma), so hue and saturation are preserved - a
+# per-channel curve would twist hue (e.g. orange drifting toward yellow).
+#
+# Anchors are sRGB 0-255 (our input -> look output). "c1" is fitted to match a
+# Capture One export patch-for-patch (its neutral ramp, measured in CIELAB via
+# compare_renditions.py - mean error ~7.6 dE, down from ~24 uncorrected, the
+# residual being C1's profile + wider Adobe RGB gamut, not lightness). "bright"
+# and "medium" are the earlier hand-tuned lifts kept for continuity. Endpoints
+# are pinned so black stays black, white white. ``none`` (default) is the
+# identity - pure colorimetric output.
+TONE_OPTIONS: Tuple[str, ...] = ("none", "medium", "bright", "c1")
 _TONE_CURVES: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {
+    "c1":     ([0, 53, 92, 129, 168, 206, 245, 255],
+               [0, 43, 103, 159, 199, 223, 239, 255]),
     "bright": ([0, 52, 85, 122, 160, 200, 243, 255],
                [0, 48, 105, 160, 200, 224, 240, 255]),
     "medium": ([0, 52, 85, 122, 160, 200, 243, 255],
@@ -394,6 +401,10 @@ _TONE_CURVES: Dict[str, Tuple[Sequence[float], Sequence[float]]] = {
 }
 _TONE_LUT_SIZE = 4096
 _TONE_LUT_CACHE: Dict[str, np.ndarray] = {}
+
+# Rec.709 luma weights - shared by the tone curve (lightness-only application)
+# and the capture sharpener (luminance-only unsharp mask).
+_LUMA = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 
 
 def _monotone_cubic_lut(x: np.ndarray, y: np.ndarray, size: int) -> np.ndarray:
@@ -441,15 +452,23 @@ def _tone_lut(tone: str) -> np.ndarray:
 
 
 def apply_tone_curve(srgb01: np.ndarray, tone: Optional[str]) -> np.ndarray:
-    """Map gamma-encoded sRGB in [0,1] through a delivery tone curve.
-    ``None``/``"none"`` is the identity (colour-accurate, colorimetric output)."""
+    """Apply a delivery tone curve to gamma-encoded sRGB in [0,1], to *luminance
+    only*: each pixel's RGB is scaled by ``f(luma)/luma``, so the curve changes
+    lightness/contrast while leaving hue and saturation untouched (a per-channel
+    curve would twist hue). ``None``/``"none"`` is the identity (colour-accurate,
+    colorimetric output)."""
     if not tone or tone == "none":
         return srgb01
     if tone not in _TONE_CURVES:
         raise ValueError(f"unknown tone {tone!r}; valid: {', '.join(TONE_OPTIONS)}")
     lut = _tone_lut(tone)
     grid = np.linspace(0.0, 1.0, lut.size, dtype=np.float32)
-    return np.interp(np.clip(srgb01, 0.0, 1.0), grid, lut).astype(np.float32)
+    luma = np.clip(srgb01 @ _LUMA, 0.0, 1.0)
+    new_luma = np.interp(luma, grid, lut).astype(np.float32)
+    # Scale RGB by the luminance gain; where luma ~ 0 there's no colour to keep,
+    # so pass through (gain 1) to avoid a divide-by-zero.
+    scale = np.where(luma > 1e-4, new_luma / np.maximum(luma, 1e-4), 1.0)
+    return np.clip(srgb01 * scale[..., None], 0.0, 1.0).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -467,7 +486,6 @@ _SHARPEN_PRESETS: Dict[str, Tuple[float, float]] = {
     "medium": (1.0, 0.9),
     "strong": (1.6, 1.1),
 }
-_LUMA = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
 
 
 def apply_sharpen(srgb01: np.ndarray, sharpen: Optional[str]) -> np.ndarray:

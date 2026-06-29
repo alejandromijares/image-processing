@@ -52,8 +52,9 @@ Two ways to get corrected images out of this component:
    ``jpeg_quality`` (95), ``white_balance`` ("camera"), ``exposure_stops`` (0.0 -
    paste the value `calibrate_color` reports to render at the calibrated
    brightness), ``tone`` ("none" - delivery look: "none" is colour-accurate /
-   colorimetric, "medium"/"bright" lift the midtones for a Capture One-style
-   punch), ``sharpen`` ("none" - capture sharpening: "light"/"medium"/"strong",
+   colorimetric, "c1" matches Capture One's brightness, "medium"/"bright" are
+   lighter hand-tuned lifts; all applied to luminance only so hue is preserved),
+   ``sharpen`` ("none" - capture sharpening: "light"/"medium"/"strong",
    since RAW is soft before sharpening), ``demosaic`` ("DHT" - RAW demosaic
    algorithm, sharper than libraw's stock AHD), ``write_sidecar`` (true),
    ``delete_after_upload`` (false).
@@ -796,9 +797,10 @@ class ColorCorrection(Camera, EasyResource):
         # `exposure_stops` on capture/develop still overrides this.
         self._exposure_stops: float = float(attrs.get("exposure_stops", 0.0))
         # Optional delivery "look" layered on the colour-accurate render: "none"
-        # (default) is pure colorimetric output; "medium"/"bright" lift the
-        # midtones for a Capture One-style punch (the CCM/hue is untouched - only
-        # lightness/contrast changes). Applied to every export and the preview.
+        # (default) is pure colorimetric output; "c1" matches Capture One's
+        # brightness, "medium"/"bright" are lighter hand-tuned lifts. The curve
+        # is applied to luminance only, so hue/saturation are untouched - only
+        # lightness/contrast changes. Applied to every export and the preview.
         self._tone: str = attrs.get("tone") or "none"
         # Capture sharpening ("none"/"light"/"medium"/"strong"): RAW is soft
         # before sharpening, so an unsharpened export looks blurry next to a
@@ -1203,8 +1205,9 @@ class ColorCorrection(Camera, EasyResource):
           ``capture_options``  forwarded to the source's ``capture`` (e.g. {"af": true})
           ``white_balance``    "camera" (default) | "auto" | "daylight" | [r,g,b,g2]
           ``exposure_stops``   exposure compensation applied at the raw stage
-          ``tone``             delivery look: "none" (colour-accurate) | "medium"
-                               | "bright" (Capture One-style midtone lift)
+          ``tone``             delivery look: "none" (colour-accurate) | "c1"
+                               (matches Capture One) | "medium" | "bright"
+                               (lighter lifts); luminance-only, hue preserved
           ``sharpen``          capture sharpening: "none" | "light" | "medium"
                                | "strong"
           ``demosaic``         RAW demosaic algorithm (DHT/AHD/AAHD/DCB/VNG/PPG)
@@ -1415,7 +1418,7 @@ class ColorCorrection(Camera, EasyResource):
           ``paths``          a list of file paths (returns {"developed": [...]})
           ``white_balance``  "camera" (default) | "auto" | "daylight" | [r,g,b,g2]
           ``exposure_stops`` exposure compensation applied at the raw stage
-          ``tone``           delivery look: "none" | "medium" | "bright"
+          ``tone``           delivery look: "none" | "c1" | "medium" | "bright"
           ``sharpen``        capture sharpening: "none"|"light"|"medium"|"strong"
           ``demosaic``       RAW demosaic algorithm (DHT/AHD/AAHD/DCB/VNG/PPG)
           ``output_formats`` subset of tiff16/tiff8/jpeg/png16/png8
